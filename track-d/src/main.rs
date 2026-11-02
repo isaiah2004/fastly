@@ -168,22 +168,6 @@ fn edge_scalar(b: &[u8], mut i: usize) -> (u32, u32, u32, usize) {
     (u, v, w, i)
 }
 
-/// Split `b[start..]` into `k` line-aligned chunks.
-fn chunks(b: &[u8], start: usize, k: usize) -> Vec<(usize, usize)> {
-    let len = b.len() - start;
-    let mut cuts = vec![start];
-    for j in 1..k {
-        let last = *cuts.last().unwrap();
-        let mut p = (start + len * j / k).max(last);
-        while p > last && p < b.len() && b[p - 1] != b'\n' {
-            p += 1;
-        }
-        cuts.push(p);
-    }
-    cuts.push(b.len());
-    cuts.windows(2).map(|w| (w[0], w[1])).collect()
-}
-
 /// The first graph (old ids), 4 bytes per edge: head << gw | weight, where the
 /// weight field gm (all ones) means "look the weight up in `big`" (sorted by edge index).
 struct Csr {
@@ -734,7 +718,14 @@ fn main() {
     let mut p = 0;
     let n = num(gb, &mut p) as usize;
     let _m = num(gb, &mut p);
-    let ch = chunks(gb, p, nt);
+    // parse work: 256 KiB blocks from a shared counter, each cut at line starts
+    const PB_: usize = 1 << 18;
+    let next = AtomicUsize::new(0);
+    let ls = |x: usize| match x {
+        x if x <= p => p,
+        x if x >= gb.len() => gb.len(),
+        x => gb[x - 1..].iter().position(|&c| c == b'\n').map_or(gb.len(), |o| x + o),
+    };
     // g0 is built from buckets of ns = nt * SUB row slots (thread t handles slots
     // t * SUB .. (t + 1) * SUB one at a time, so its scattered writes stay in cache).
     // parts[p], bucket j: edges parsed by thread p whose tail is in slot j, packed as
@@ -748,20 +739,25 @@ fn main() {
     let ub = (0..ns).map(|j| usize::BITS - (slos[j + 1] - slos[j]).leading_zeros()).max().unwrap();
     let wb = 48u32.saturating_sub(nb + ub).min(16);
     let (vs, vm, wm) = (wb + nb, (1u64 << nb) - 1, (1u32 << wb) - 1);
-    let res = par(nt, |t| {
-        let (a, b) = ch[t];
-        let mut bk = Buckets::new(ns, (b - a) / 18 * 21 / 20);
+    let res = par(nt, |_| {
+        let mut bk = Buckets::new(ns, (gb.len() - p) / nt / 18 * 21 / 20);
         let mut huge = Vec::new();
-        let mut i = a;
-        while i < b {
-            let (u, v, w, j) = edge(gb, i);
-            i = j;
-            if u == v {
-            } else if w < wm {
-                let o = sown(u);
-                bk.push(o, ((u as usize - slos[o]) as u64) << vs | (v as u64) << wb | w as u64);
-            } else {
-                huge.push([u, v, w]);
+        loop {
+            let k = p + next.fetch_add(PB_, Relaxed);
+            if k >= gb.len() {
+                break;
+            }
+            let (mut i, b) = (ls(k), ls(k + PB_));
+            while i < b {
+                let (u, v, w, j) = edge(gb, i);
+                i = j;
+                if u == v {
+                } else if w < wm {
+                    let o = sown(u);
+                    bk.push(o, ((u as usize - slos[o]) as u64) << vs | (v as u64) << wb | w as u64);
+                } else {
+                    huge.push([u, v, w]);
+                }
             }
         }
         (bk, huge)
