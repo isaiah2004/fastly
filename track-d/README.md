@@ -2,7 +2,7 @@
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/d-traverse.md). In short: a directed road-like graph (1,740,512 nodes, 5,000,000 edges, u32 weights including 0 and ~2^32), 2,000 point-to-point queries, and exact shortest distances or `-1`. Preprocessing counts toward the time.
 
-Board: commit fee1215, run-7213cfc0f5c2, **T 151.4 ms, M 71.3 MB, K 22.55** (reference 72.69 s, 893 MB).
+Board: commit fee1215, run-7213cfc0f5c2, **T 151.4 ms, M 71.3 MB, K 22.55** (reference 72.69 s, 893 MB). Steps 14–15 of PERF.md (thread-local reverse graph, in-place forward graph) come after that run.
 
 ## Approach
 
@@ -12,9 +12,9 @@ The run is one pipeline on a persistent pool of 12 parked threads. Phase times a
 |---|---|---|
 | Parse | `mmap` (`MAP_POPULATE`); each thread takes a line-aligned chunk. One AVX2 32-byte compare and movemask finds a line's two spaces and newline, and SWAR multiplies convert the digits. Each edge becomes a packed 6-byte entry `(tail offset, head, weight)` in a bucket for the cache-sized slot (8 per thread) that owns its tail. Buckets are chains of 512-entry blocks cut from per-thread slabs. | 18 ms |
 | First graph | Per slot: count degrees, prefix-sum and scatter while the slot's buckets are still in L2. 4 bytes per edge: `head << (32 - bits(n)) \| weight`, with heavy weights in a sorted side table. | 15 ms |
-| Renumber | Parallel BFS region growing: regions of up to 16k nodes, nodes claimed by CAS on a per-node tag, two-stage prefetch (rows 16 ahead, neighbour tags 8 ahead). Each thread copies the rows of the nodes it places while they are hot, already in the final encoding. A new id is a prefix sum plus the index in the thread's list, so no permutation array is ever built. | 33 ms |
-| Forward graph | The threads' rows laid side by side. 4 bytes per edge: `(head - tail + 2^15) << 15 \| weight` when both fit, else an escape into a flat `(head, weight)` table (~4% of edges). Row offsets: a u32 base per 16 nodes plus a u16 each. | 10 ms |
-| Reverse graph | Threads own equal node ranges: count in-edges (edges into another thread's range go over in hand-over lists), prefix, fill. Same encoding. | 22 ms |
+| Renumber | Parallel BFS region growing: regions of up to 16k nodes, nodes claimed by CAS on a per-node tag, two-stage prefetch (rows 16 ahead, neighbour tags 8 ahead). Each thread copies the rows of the nodes it places while they are hot, already in the final encoding, straight into its own window of the forward edge array (address space reserved once, untouched pages never committed). A new id is a prefix sum plus the index in the thread's list, so no permutation array is ever built; one dummy node closes each thread's segment. | 33 ms |
+| Forward graph | Already in place after the BFS; only row offsets and escape keys are resolved. 4 bytes per edge: `(head - tail + 2^15) << 15 \| weight` when both fit, else an escape into a flat `(head, weight)` table (~4% of edges). Row offsets: a u32 base per 16 nodes plus a u16 each. | 4 ms |
+| Reverse graph | Thread-local: each thread owns its BFS segment, so packed edges never cross threads and only the ~4% escaped edges are handed over. Count into the thread's own window of the offsets, prefix, fill each row from its end. Escapes are counted first, so no fix-up pass. Same encoding. | 19 ms |
 | Queries | Bidirectional Dijkstra, one atomic work counter over the distinct queries, longest \|s - t\| first. | 90 ms |
 
 **The query loop:**
@@ -45,7 +45,7 @@ The run is one pipeline on a persistent pool of 12 parked threads. Phase times a
 - **ALT (landmarks):** not built. Estimated cost per landmark: a forward and a backward full Dijkstra (at ~150 ns per settled node, ~0.26 s each on one thread) plus 14 MB of distances. Even 6 landmarks run in parallel would cost more time than the 2,000 queries take now, and push memory past 150 MB.
 - **Radix heap:** tried twice, slower both times. The heaps are small, so the 4-ary heap stays in L1.
 - **Two queries interleaved per thread:** no gain, because the next settle's row and labels are already prefetched.
-- **PGO:** not used, because it was unclear whether the rules allow profile-guided builds.
+- **PGO:** built with a profile trained only on generator seed 7 (`sample` ×3, `tiny` ×1, never the scored seed 1), then measured: about 8% slower in every Docker A/B (e.g. 269 vs 247 ms best on 8 P-core threads). Not used.
 
 Smaller dead ends are listed in PERF.md.
 

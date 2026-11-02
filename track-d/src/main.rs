@@ -86,6 +86,24 @@ fn atomics(v: &mut [u32]) -> &[AtomicU32] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const AtomicU32, v.len()) }
 }
 
+/// Address space for n Ts; pages are committed only where written. No huge pages,
+/// so a window's partly used tail costs at most one small page.
+fn reserve<T>(n: usize) -> *mut T {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" {
+            fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
+            fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
+        }
+        let l = n * std::mem::size_of::<T>();
+        let p = mmap(std::ptr::null_mut(), l, 3, 0x4022, -1, 0); // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+        madvise(p, l, 15); // MADV_NOHUGEPAGE
+        p as *mut T
+    }
+    #[cfg(not(target_os = "linux"))]
+    Vec::with_capacity(n).leak().as_mut_ptr()
+}
+
 fn uninit<T>(m: usize) -> Vec<T> {
     let mut v = Vec::with_capacity(m);
     unsafe { v.set_len(m) };
@@ -194,8 +212,8 @@ impl Csr {
 /// locality renumbering nearly every edge fits.
 struct Cg {
     off: Off,
-    e: Vec<u32>,
-    ext: Vec<(u32, u32)>,
+    e: &'static [u32],
+    ext: &'static [(u32, u32)],
 }
 
 const ESC: u32 = 1 << 31;
@@ -390,7 +408,7 @@ struct Rows {
 /// Locality order: parallel region growing (BFS from seeds, regions capped).
 /// Each thread copies the rows of the nodes it placed while they are hot.
 /// `tag` gets (thread << 26) | (index in that thread's list) for every node.
-fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32]) -> Vec<Rows> {
+fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32], win: (P<u32>, P<(u32, u32)>, usize)) -> Vec<Rows> {
     const CAP: usize = 16384;
     const D1: usize = 16;
     const D2: usize = 8;
@@ -414,7 +432,7 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32]) -> Vec<Rows> {
                     continue;
                 }
             }
-            r.e.push(ESC | r.ext.len() as u32);
+            r.e.push(ESC | (t * win.2 + r.ext.len()) as u32);
             r.ext.push((if tv == NONE { ESC | hv } else { tv }, w));
         }
     };
@@ -422,8 +440,9 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32]) -> Vec<Rows> {
         // the BFS queue of the current region; earlier regions' nodes number 0..done
         let mut list: Vec<u32> = Vec::with_capacity(2 * CAP);
         let mut done = 0;
-        let c = g.e.len() / nt * 5 / 4;
-        let mut r = Rows { len: 0, deg: Vec::with_capacity(n / nt * 5 / 4), bigdeg: Vec::new(), e: Vec::with_capacity(c), ext: Vec::new() };
+        // e and ext live in this thread's windows of the shared forward arrays (never reallocated)
+        let (e, ext) = unsafe { (Vec::from_raw_parts(win.0.at(t * win.2), 0, win.2), Vec::from_raw_parts(win.1.at(t * win.2), 0, win.2)) };
+        let mut r = Rows { len: 0, deg: Vec::with_capacity(n / nt * 5 / 4), bigdeg: Vec::new(), e, ext };
         for s in (n * t / nt)..(n * (t + 1) / nt) {
             if !claim(s, t << 26 | done) {
                 continue;
@@ -805,40 +824,40 @@ fn main() {
     drop(parts);
     let g0 = Csr { off: off0, e: e0, big, gw, gm };
     let mut tag = vec![NONE; n];
-    let parts = order(&g0, n, nt, atomics(&mut tag));
+    // thread t's rows go to window [t * m, t * m + its edges) of the forward arrays,
+    // written in place by the BFS: no concatenation copy
+    let win = (P(reserve::<u32>(nt * m)), P(reserve::<(u32, u32)>(nt * m)), m);
+    let parts = order(&g0, n, nt, atomics(&mut tag), win);
     drop(g0);
-    let (mut nb0, mut eb0, mut xb0) = (vec![0usize], vec![0usize], vec![0usize]);
+    // node ids: thread t's i-th node is nb0[t] + i; a dummy node closes each thread's
+    // segment (its row is the unused rest of the window, it is never reached)
+    let mut nb0 = vec![0usize];
     for p in &parts {
-        nb0.push(nb0.last().unwrap() + p.len);
-        eb0.push(eb0.last().unwrap() + p.e.len());
-        xb0.push(xb0.last().unwrap() + p.ext.len());
+        nb0.push(nb0.last().unwrap() + p.len + 1);
     }
-    // new id from a tag: thread t's i-th node is nb0[t] + i
+    let n2 = nb0[nt];
     let id = |x: u32| (nb0[x as usize >> 26] + (x as usize & ((1 << 26) - 1))) as u32;
     let nid = |old: u32| id(tag[old as usize]);
-    // forward graph: the threads' rows side by side, escapes resolved
-    let mut off: Vec<u32> = uninit(n + 1);
-    let mut fe: Vec<u32> = uninit(m);
-    let mut fx: Vec<(u32, u32)> = uninit(*xb0.last().unwrap());
-    let (op, ep, xp) = (P(off.as_mut_ptr()), P(fe.as_mut_ptr()), P(fx.as_mut_ptr()));
+    let mut off: Vec<u32> = uninit(n2 + 1);
+    let op = P(off.as_mut_ptr());
     par(nt, |t| {
         let r = &parts[t];
-        let (mut o, mut bd) = (eb0[t], r.bigdeg.iter());
+        let (mut o, mut bd) = (t * m, r.bigdeg.iter());
         for (i, &d) in r.deg.iter().enumerate() {
             *op.at(nb0[t] + i) = o as u32;
             o += if d < 255 { d as usize } else { bd.next().unwrap().1 as usize };
         }
-        for (j, &x) in r.e.iter().enumerate() {
-            *ep.at(eb0[t] + j) = if x & ESC != 0 { x + xb0[t] as u32 } else { x };
-        }
-        for (j, &(key, w)) in r.ext.iter().enumerate() {
-            let v = if key < ESC { id(key) } else { nid(key - ESC) };
-            *xp.at(xb0[t] + j) = (v, w);
+        *op.at(nb0[t + 1] - 1) = o as u32;
+        for j in t * m..t * m + r.ext.len() {
+            let (key, w) = *win.1.at(j);
+            *win.1.at(j) = (if key < ESC { id(key) } else { nid(key - ESC) }, w);
         }
     });
-    off[n] = m as u32;
-    drop(parts);
-    let fwd = Cg { off: Off::new(&off, nt), e: fe, ext: fx };
+    off[n2] = (nt * m) as u32;
+    for p in parts {
+        std::mem::forget((p.e, p.ext));
+    }
+    let fwd = unsafe { Cg { off: Off::new(&off, nt), e: std::slice::from_raw_parts(win.0 .0, nt * m), ext: std::slice::from_raw_parts(win.1 .0, nt * m) } };
     drop(off);
     // distinct queries (duplicate lines are answered once)
     let (mut qs, mut qi, mut seen) = (Vec::new(), Vec::new(), std::collections::HashMap::new());
@@ -857,11 +876,11 @@ fn main() {
     // those go over in lists of (head, tail, weight). Each thread counts into, prefixes
     // and fills its own window of roff; escapes are counted first so their indices are final.
     let seg = |v: u32| nb0.partition_point(|&b| b <= v as usize) - 1;
-    let mut roff = vec![0u32; n + 1];
+    let mut roff = vec![0u32; n2 + 1];
     let rp = P(roff.as_mut_ptr());
     let cross = par(nt, |t| {
         let (mut cr, mut xc) = (vec![Vec::new(); nt], vec![0u32; nt]);
-        for u in nb0[t]..nb0[t + 1] {
+        for u in nb0[t]..nb0[t + 1] - 1 {
             for k in fwd.row(u) {
                 let (v, w) = fwd.edge(u as u32, k);
                 let o = if fwd.e[k] & ESC == 0 { t } else { seg(v) };
@@ -902,7 +921,7 @@ fn main() {
                 ESC | (xb[t] + ext.len() as u32 - 1)
             });
         };
-        for u in nb0[t]..nb0[t + 1] {
+        for u in nb0[t]..nb0[t + 1] - 1 {
             for k in fwd.row(u) {
                 let (v, w) = fwd.edge(u as u32, k);
                 if fwd.e[k] & ESC == 0 || seg(v) == t {
@@ -915,22 +934,23 @@ fn main() {
         }
         ext
     });
-    roff[n] = m as u32;
+    roff[n2] = m as u32;
     drop(cross);
-    let bwd = Cg { off: Off::new(&roff, nt), e: re, ext: rx.concat() };
+    let bwd = Cg { off: Off::new(&roff, nt), e: re.leak(), ext: rx.concat().leak() };
     drop(roff);
 
     // likely long searches first (ids far apart), so the phase does not end on one
     let mut qo: Vec<usize> = (0..qs.len()).collect();
     qo.sort_by_key(|&k| std::cmp::Reverse(qs[k].0.abs_diff(qs[k].1)));
+    let nq = usize::BITS - n2.leading_zeros();
     let ans: Vec<AtomicU64> = (0..qs.len()).map(|_| AtomicU64::new(0)).collect();
     let next = AtomicUsize::new(0);
     par(nt, |_| {
-        let (mut st, mut sw) = (St::<u32>::new(n), St::<u64>::new(n));
+        let (mut st, mut sw) = (St::<u32>::new(n2), St::<u64>::new(n2));
         while let Some(&k) = qo.get(next.fetch_add(1, Relaxed)) {
             let (s, t) = qs[k];
-            let d = query([&fwd, &bwd], &mut st, s, t, nb)
-                .or_else(|| query([&fwd, &bwd], &mut sw, s, t, nb))
+            let d = query([&fwd, &bwd], &mut st, s, t, nq)
+                .or_else(|| query([&fwd, &bwd], &mut sw, s, t, nq))
                 .unwrap_or_else(|| slow(&fwd, s, t));
             ans[k].store(d, Relaxed);
         }
