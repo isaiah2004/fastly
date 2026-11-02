@@ -16,7 +16,7 @@ const OC: usize = NE * 256; // output bytes per hour, at most: a line per endpoi
 // BLK records in the hour's region; FILL ends a block early. Loc: per hour, a thread's write position and block end.
 type Loc = [(u32, u32); H];
 
-// endpoint intern table shared by all threads: slot = hash>>32<<32 | len<<16 | id+1; bytes in ent[slot]
+// endpoint intern table shared by all threads: slot = hash<<32 | len<<16 | id+1; bytes in ent[slot]
 #[repr(align(64))]
 struct Ent([u8; 128]);
 struct Tab {
@@ -30,7 +30,7 @@ struct Tab {
 // endpoint id: probe from the hash, insert if new
 #[inline(always)]
 unsafe fn find(tb: &Tab, e: *const u8, n: usize, hv: u64) -> usize {
-	let tag = hv >> 32 << 32 | (n as u64) << 16;
+	let tag = hv << 32 | (n as u64) << 16;
 	let mut s = hv as usize & (TS - 1);
 	loop {
 		let sl = tb.slot.get_unchecked(s);
@@ -60,29 +60,22 @@ mod v {
 	#[inline(always)]
 	pub unsafe fn mask(p: *const u8, c: u8) -> u32 { _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p as _), _mm256_set1_epi8(c as i8))) as u32 }
 	const IO: [i8; 32] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31];
-	// 64 ones, then 64 zeros: from 64-n, the mask of the first n bytes
-	static MK: [u8; 128] = {
-		let mut m = [0u8; 128];
+	// 128 ones, then 128 zeros: from 128-n, the mask of the first n bytes
+	static MK: [u8; 256] = {
+		let mut m = [0u8; 256];
 		let mut i = 0;
-		while i < 64 {
+		while i < 128 {
 			m[i] = 255;
 			i += 1;
 		}
 		m
 	};
-	// the n bytes at p equal the n bytes at s
+	// the n bytes (at most 128) at p equal the n bytes at s
 	#[inline(always)]
 	pub unsafe fn eq(p: *const u8, n: usize, s: *const u8) -> bool {
-		let mut k = 0;
-		while k < n {
-			let m = MK.as_ptr().add(64 - (n - k).min(64));
-			let d = |o: usize| _mm256_testz_si256(_mm256_xor_si256(_mm256_loadu_si256(p.add(k + o) as _), _mm256_loadu_si256(s.add(k + o) as _)), _mm256_loadu_si256(m.add(o) as _));
-			if d(0) & d(32) == 0 {
-				return false;
-			}
-			k += 64;
-		}
-		true
+		let m = MK.as_ptr().add(128 - n);
+		let d = |o: usize| _mm256_testz_si256(_mm256_xor_si256(_mm256_loadu_si256(p.add(o) as _), _mm256_loadu_si256(s.add(o) as _)), _mm256_loadu_si256(m.add(o) as _));
+		d(0) & d(32) != 0 && (n <= 64 || d(64) & d(96) != 0)
 	}
 	// index of the last space in the 16 bytes at p
 	#[inline(always)]
@@ -98,13 +91,13 @@ mod v {
 	}
 }
 
-// hash of the n endpoint bytes at p from its first, middle and last 8 (find compares the bytes)
+// 32-bit CRC of the n endpoint bytes at p: its first, middle and last 8 (find compares the bytes)
 #[inline(always)]
 unsafe fn hash(p: *const u8, n: usize) -> u64 {
-	let r = |o: usize| (p.add(o) as *const u64).read_unaligned();
-	let (a, b, c) = if n >= 8 { (r(0), r((n - 8) / 2), r(n - 8)) } else { (r(0) & !(u64::MAX << (8 * n)), 0, 0) };
-	let h = (a ^ n as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ b.wrapping_mul(0xC2B2AE3D27D4EB4F).rotate_left(21) ^ c.wrapping_mul(0x165667B19E3779F9).rotate_left(42);
-	h ^ (h >> 29)
+	use std::arch::x86_64::_mm_crc32_u64 as crc;
+	let (m, o) = (!0u64 >> (64 - 8 * n.min(8)), n.max(8) - 8);
+	let r = |o: usize| (p.add(o) as *const u64).read_unaligned() & m;
+	crc(crc(crc(n as u64, r(0)), r(o / 2)), r(o))
 }
 
 // endpoint start: the first '/' after the 27-byte timestamp and the method
