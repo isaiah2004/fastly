@@ -37,3 +37,12 @@ All local, none pushed:
 - **First graph's arrays recycled for the forward graph:** no change, because transparent huge pages make the fresh page faults cheap.
 - **Flat labels**, labels for both directions on the same lines vs split, ordering the regions a second time (BLOB), sorting queries by source, prefetching heap children, a label pre-pass prefetch: all neutral.
 - **PGO:** held back, because it was unclear whether build-time profiling is allowed under the rules.
+
+## Structural options evaluated on Nov 2
+
+None of these reached the board.
+
+- **Multi-cursor parse (built and measured):** 4 cursors per thread, stepped in turns. No gain: 21.5 vs 20.6 ms best native, 24.4 vs 22.4 ms in Docker on cpuset 0-7. The line-to-line dependency is only about 20 cycles; parse is bound by writing about 30 MB of buckets and faulting their pages. Dropped.
+- **BFS emitting only the order, then one combined forward and reverse scatter (estimated):** the BFS alone is about 22 of the 33 ms of renumbering. Copying rows while hot replaced a separate pass in step 10 and saved about 15 ms; a separate pass would fetch every row again from random places. The most it could save is the forward copy (6–10 ms in Docker), and that needs per-thread segments of the final array with gaps, costing up to 2 MB of huge-page rounding per thread (about +12 MB). The reverse graph still needs a count pass in the new numbering. Net estimate 0–3%; not built.
+- **Memory toward ~45 MB of our own (estimated):** weights already sit in 15 bits of each 4-byte edge with an escape table, and the first graph is freed before the reverse build. The peak (~62 MB) is at the end of renumbering: first graph 27 + tags 7 + copied rows 24 MB, all needed then. An order-only BFS has the same peak (~65 MB). Getting much lower means never holding two full graphs at once, which in practice means no renumbering; without renumbering the queries take 299 vs 127 ms (step 8).
+- **16-byte node record holding labels and row offset (estimated):** labels are per query and per thread (sparse 64-id pages, ~0.5 MB per side per thread). A dense per-node record would take n × 16 B = 28 MB per thread, about 330 MB at 12 threads, so it cannot share a record with the graph's offsets. Context: one-way Dijkstra would settle about 24.6M nodes over the 2000 queries (mean Dijkstra rank ~12.3k) and ours settles 7.5M. ALT with 8 landmarks would need 16 full searches (~27M settles, 3.6× our whole query work) before answering anything.
