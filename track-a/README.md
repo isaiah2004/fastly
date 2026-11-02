@@ -4,14 +4,17 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only, Linux and AVX2 (`target-cpu=x86-64-v3`). One scoped pool of `available_parallelism()` threads that sync on a `Barrier` between phases.
+Rust, standard library only, Linux and AVX2 (`target-cpu=x86-64-v3`). One scoped pool of `available_parallelism()` threads. Each thread loops: it takes a finished hour if one is ready, else the next input chunk (a mutex keeps the shared progress).
 
 1. **Single pass (read, parse, intern, record).** Threads take 64 KB chunks of the log from an atomic counter and `pread` each chunk (plus up to 512 bytes, to finish the last line) into a buffer that stays in L2. A chunk owns the lines that start in it. Newline positions go into a list first, two per 64 bytes and without branching, so the line loop is predictable. For each line:
    - The hour index (0..71) comes straight from the day and hour digits. All timestamps fall in one fixed 72-hour window, so there is no date parsing.
    - The endpoint starts at the first `/` (SWAR) and ends 4 bytes before the last space, which an SSE compare finds. The latency is parsed by an SSE `maddubs`/`madd` routine that has no branches.
    - The endpoint is hashed from its first, middle and last 8 bytes and interned in one lock-free open-addressing table that all threads share. Each slot is one 8-byte word (32-bit hash tag, length, id). The bytes are kept zero-padded beside it and are always compared (one 64-byte AVX2 step for endpoints up to 64 bytes), so the result is exact. Ids are global, so no merge step is needed.
-   - The line becomes one `u32` record, `id<<21 | error<<20 | latency`, appended to the thread's current block for that hour. A latency of 2^20-1 or more is written as an escape value followed by the full latency in a second record (about 1% of lines). Each hour has its own region of a reserved (`MAP_NORESERVE`), small-page arena, and threads take 512-record blocks from it with an atomic counter.
-2. **Per hour (dynamic).** After a barrier, each thread sorts the ~1,842 endpoint ids by bytes for itself (no second barrier). Then each worker takes the next hour:
+   - The line becomes one `u32` record, `(id+1)<<21 | error<<20 | latency`, appended to the thread's current block for that hour. A latency of 2^20-1 or more is written as an escape value followed by the full latency in a second record (about 1% of lines). Each hour has its own region of a reserved (`MAP_NORESERVE`), small-page arena, and threads take 512-record blocks from it with an atomic counter.
+2. **Finished hours, while the parse runs.** The log is interleaved shards, so it is close to time order. An hour is *finished* once the chunks parsed contiguously from the start of the file contain a line two hours later. Its records are complete once every chunk handed out by then has been parsed, and a thread then takes the hour (no barrier):
+   - Correctness does not depend on the order. A later chunk that meets a line of a finished hour skips it and sets a flag; the program then runs again with hours finished only after the whole file is parsed, which is exact for any order. Generated logs, whose lines are at most minutes late, never trigger this.
+   - Records only live for about three hours of log, so the record memory stays small instead of holding the whole file.
+   - Endpoints are kept in byte order per thread: the hour's new endpoint ids are added and the list is re-sorted.
    - It walks the hour's region twice (count per endpoint, then scatter the latencies by endpoint rank into a per-thread array of about 170 KB that stays in L2), then releases the region with `MADV_DONTNEED`.
    - It takes exact nearest-rank p50, p95 and p99 per group with `select_nth_unstable`: p50 on the whole group, p95 on the part above it, p99 on the part above that. Groups of 20 or fewer are sorted instead.
    - It formats the hour's lines (branch-free 2-digit LUT itoa) into the hour's slot of a reserved output area.
