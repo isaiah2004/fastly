@@ -29,13 +29,15 @@ Rust, std only, one file (`src/main.rs`), for Linux on x86-64 with AVX2, BMI2 an
   unquoted and `""` names share one key. The table is split into one slot range per thread, chosen by
   the name's hash, and only the range's owner touches it: parsers send each record's (name, country) as
   a 32-byte message in batches over lock-free stacks, and the owner probes its range (prefetching a few
-  messages ahead) with plain loads and stores. Each thread may have at most 4 batches per owner in
+  messages ahead) with plain loads and stores. A one-byte hash tag per slot (128 KiB in all) is probed
+  first, so only the one line that can hold the name is prefetched and read. Each thread may have at most 4 batches per owner in
   flight; a thread that runs out applies waiting batches (taking the range's lock), so memory stays
-  bounded and late or descheduled threads do not stall the rest. `names_distinct` is a popcount per
-  country. Parsed records wait in a 128-record stage while their region entries are prefetched, then are
+  bounded and late or descheduled threads do not stall the rest. `names_distinct` is counted per
+  country when a group bit is first set. Parsed records wait in a 128-record stage while their region entries are prefetched, then are
   aggregated and sent.
 - **Memory.** ~12 MB peak anonymous memory locally: 8 MB name table (huge pages requested), 1 MB region
   table, message batches, the rest runtime. One glibc malloc arena (`mallopt`); 256 KiB thread stacks.
+  File pages are released early (`MADV_DONTNEED`): `regions.csv` once parsed, each input chunk once done.
 - **Fallbacks.** More than ~114k distinct names, more than 255 countries, or an unexpected `regions.csv`
   shape also fall back to the exact sequential path. `--slow` forces it (used for cross-checking).
 
@@ -51,6 +53,16 @@ target/release/solution [--data /data] [--out /out] [--threads N] [--slow] [--ch
 ```
 
 The Docker image builds the same binary (`target-cpu=x86-64-v3`) and runs it with the defaults.
+
+The build is profile-guided: `.cargo/config.toml` passes `-C profile-use=pgo.profdata`. PGO profile
+trained on generator seed 7 (not the scored data); the profile is a build input and contains no answers.
+It was made with `spec/generators/c_join.py --seed 7` at the `sample` and `tiny` scales plus one hostile
+2.1-legal file from our fuzzer (so the sequential fallback is profiled too): build in
+`halloumee/speed-demon-rust:1.99.1-trixie-llvm-tools` with `RUSTFLAGS="-C target-cpu=x86-64-v3 -C
+target-feature=+pclmulqdq -C profile-generate=/pgo"`, run it 3 times on `sample`, once on `tiny` and once
+on the hostile file, then `llvm-profdata merge -o pgo.profdata /pgo/*.profraw`. The board's build image has
+the same rustc 1.99.1, so the Dockerfile is unchanged. A stale profile only costs speed: rustc warns and
+still builds.
 `--chunks` only exists for boundary testing.
 
 ## Testing

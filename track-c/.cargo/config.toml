@@ -1,2 +1,4 @@
 [build]
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+pclmulqdq"]
+# pgo.profdata: a profile of this program on generator seed 7 data (not the scored data), merged with llvm-profdata
+# from the same rustc 1.99.1; see README
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+pclmulqdq", "-C", "profile-use=pgo.profdata"]
