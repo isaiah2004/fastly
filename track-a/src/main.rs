@@ -264,7 +264,7 @@ unsafe fn work(t: usize, c: &Cx) {
 		let o = a.saturating_sub(1);
 		let k = (a + CS + PAD).min(len) - o;
 		c.inp.read_exact_at(&mut w[..k], o as u64).unwrap();
-		let x = if a == 0 { 0 } else { w.iter().position(|&b| b == b'\n').unwrap() + 1 };
+		let x = (a > 0) as usize * (w.iter().position(|&b| b == b'\n').unwrap() + 1);
 		pass(w.as_ptr(), x, (a + CS).min(len) - o, l, c);
 	}
 	for &(p, e) in l.iter() {
@@ -311,12 +311,13 @@ unsafe fn work(t: usize, c: &Cx) {
 		let o = c.txt.add(h * OC);
 		let mut q = o;
 		for &id in &od {
-			let n = cnt[id] as u32 as usize;
+			let (n, e) = (cnt[id] as u32 as usize, (cnt[id] >> 32) as u32);
 			if n == 0 {
 				continue;
 			}
 			let v = &mut v[off[id] as usize - n..off[id] as usize];
-			let (r50, r95, r99) = ((50 * n + 99) / 100, (95 * n + 99) / 100, (99 * n + 99) / 100);
+			let r = |p: usize| (p * n + 99) / 100;
+			let (r50, r95, r99) = (r(50), r(95), r(99));
 			let ps = if n <= 20 {
 				v.sort_unstable();
 				[v[r50 - 1], v[r95 - 1], v[r99 - 1]]
@@ -325,12 +326,12 @@ unsafe fn work(t: usize, c: &Cx) {
 				let p95 = *v[r50..].select_nth_unstable(r95 - 1 - r50).1;
 				[p50, p95, *v[r95..].select_nth_unstable(r99 - 1 - r95).1]
 			};
-			let e = cnt[id] >> 32;
 			for b in [&hs[..], nm(id)] {
 				std::ptr::copy_nonoverlapping(b.as_ptr(), q, b.len());
 				q = q.add(b.len());
 			}
-			for x in [n as u32, ps[0], ps[1], ps[2], e as u32, (e * 1_000_000 / n as u64) as u32] {
+			let pm = (e as u64 * 1_000_000 / n as u64) as u32;
+			for x in [n as u32, ps[0], ps[1], ps[2], e, pm] {
 				q = num(q, x);
 			}
 			*q = b'\n';
@@ -348,9 +349,9 @@ unsafe fn work(t: usize, c: &Cx) {
 			}
 		}
 		for (k, at, n) in w {
-			let b = c.txt.add(k * OC);
-			c.file.write_all_at(std::slice::from_raw_parts(b, n), at as u64).unwrap();
-			free(b, n);
+			let b = std::slice::from_raw_parts(c.txt.add(k * OC), n);
+			c.file.write_all_at(b, at as u64).unwrap();
+			free(b.as_ptr(), n);
 		}
 	}
 }
@@ -372,7 +373,7 @@ fn main() {
 		bar: Barrier::new(nt),
 		tb: Tab {
 			slot: (0..TS).map(|_| AtomicU64::new(0)).collect(),
-			ent: unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(TS * 128, 64).unwrap()) as *mut Ent },
+			ent: arena(TS * 128) as _,
 			nid: AU::new(0),
 			gs: (0..NE).map(|_| AtomicU32::new(0)).collect(),
 		},
@@ -386,8 +387,9 @@ fn main() {
 	};
 	let c = &c;
 	std::thread::scope(|sc| {
-		for t in 0..nt {
+		for t in 1..nt {
 			sc.spawn(move || unsafe { work(t, c) });
 		}
+		unsafe { work(0, c) };
 	});
 }
