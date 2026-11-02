@@ -20,6 +20,7 @@ struct Tab {
     sh: u32,
     keys: Vec<Key>,
     long: Vec<(u32, Key)>, // after keys is dropped: the terms longer than 12 bytes, by id
+    miss: u32, // lookup result for other tokens: MISS, then the dummy term after renumber
 }
 // Hash of a term of at most 12 bytes from its first 8 bytes and the next 4 (same as hk), top 32 bits.
 #[inline(always)]
@@ -37,6 +38,7 @@ impl Tab {
             sh: 64 - bits,
             keys: Vec::new(),
             long: Vec::new(),
+            miss: MISS,
         }
     }
     fn intern_h(&mut self, k: &Key, h: u64) -> u32 {
@@ -84,6 +86,7 @@ impl Tab {
         for s in self.slots.iter_mut().filter(|s| s.0 != 0) {
             s.2 = nid[s.2 as usize] | (f[nid[s.2 as usize] as usize] as u32) << 24;
         }
+        self.miss = nid.len() as u32;
     }
     #[inline(always)]
     fn get(&self, k: &Key) -> u32 {
@@ -111,7 +114,7 @@ impl Tab {
                 return s.2;
             }
             if s.0 == 0 {
-                return MISS;
+                return self.miss;
             }
             i = (i + 1) & m;
         }
@@ -127,7 +130,7 @@ impl Tab {
                 return s.2;
             }
             if s.0 == 0 {
-                return MISS;
+                return self.miss;
             }
             i = (i + 1) & m;
         }
@@ -479,7 +482,6 @@ impl W {
             } else {
                 c.tab.get12(k0, k1, h)
             };
-            let r = if r == MISS { c.dummy } else { r };
             let ti = (r & 0xFF_FFFF) as usize;
             let fl = r >> 24; // 1 list, 2 bitmap (bitmap index = id), 4 phrase key
             unsafe {
@@ -496,8 +498,10 @@ impl W {
                         sl += c.ew;
                     }
                 }
-                *self.kp.as_mut_ptr().add(kl) = pos as u32;
-                kl += ((fl >> 2) & 1) as usize;
+                if fl & 4 != 0 {
+                    *self.kp.as_mut_ptr().add(kl) = pos as u32; // rare (2% of tokens)
+                    kl += 1;
+                }
             }
         }
         unsafe {
@@ -557,7 +561,7 @@ fn worker(c: &Ctx, bounds: &[usize]) -> Vec<WOut> {
                             if len <= 32 {
                                 c.tab.get(&load_key(buf, s, len))
                             } else {
-                                MISS
+                                c.dummy
                             } as u64,
                             u32::MAX,
                             0,
@@ -1134,7 +1138,7 @@ fn main() {
                     Set::L(
                         post[goff[t] as usize..goff[t + 1] as usize]
                             .iter()
-                            .map(|&x| x.wrapping_sub(d0 as u16) as u32)
+                            .map(|&x| x as u32) // the low 16 bits are the id in the round
                             .collect(),
                     )
                 }
@@ -1197,8 +1201,8 @@ fn main() {
                                 let t = t as usize - nbm;
                                 let l = &post[goff[t] as usize..goff[t + 1] as usize];
                                 let keep = op == b'A';
-                                let (mut j, b0) = (0, d0 as u16);
-                                let at = |j: usize| l[j].wrapping_sub(b0) as u32;
+                                let mut j = 0;
+                                let at = |j: usize| unsafe { *l.get_unchecked(j) } as u32;
                                 let gal = a.len() * 16 < l.len();
                                 a.retain(|&x| {
                                     if gal {
@@ -1208,8 +1212,7 @@ fn main() {
                                             step <<= 1;
                                         }
                                         let h = (j + step).min(l.len());
-                                        j += l[j..h]
-                                            .partition_point(|&y| (y.wrapping_sub(b0) as u32) < x);
+                                        j += l[j..h].partition_point(|&y| (y as u32) < x);
                                     }
                                     while j < l.len() && at(j) < x {
                                         j += 1;
