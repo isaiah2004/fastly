@@ -32,6 +32,8 @@ None (std only; `mmap`, `madvise` and `mallopt` are declared via `extern "C"`).
 
 Defaults are `/data/requests.log` and `/out/summary.txt`.
 
+The build is profile-guided: `.cargo/config.toml` passes `-C profile-use=pgo.profdata`. PGO profile trained on generator seed 7 (not the scored data); profile is a build input and contains no answers. It was made with `spec/generators/a_ingest.py --seed 7` at the `sample` and `tiny` scales: build in `halloumee/speed-demon-rust:1.99.1-trixie-llvm-tools` with `RUSTFLAGS="-C target-cpu=x86-64-v3 -C profile-generate=/pgo"`, run it 3 times on `sample` and once on `tiny`, then run `llvm-profdata merge -o pgo.profdata /pgo/*.profraw`. The board's build image has the same rustc 1.99.1, so the Dockerfile is unchanged. A stale profile only costs speed: rustc warns and still builds.
+
 ## With another 24 hours
 
 - Hide the intern table's L2 latency at full thread count (prefetching helped one thread but not twelve).

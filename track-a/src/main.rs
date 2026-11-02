@@ -60,19 +60,24 @@ mod v {
 	#[inline(always)]
 	pub unsafe fn mask(p: *const u8, c: u8) -> u32 { _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p as _), _mm256_set1_epi8(c as i8))) as u32 }
 	const IO: [i8; 32] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31];
-	// 32 bytes at p, bytes from index rem on zeroed
-	#[inline(always)]
-	unsafe fn block(p: *const u8, rem: usize) -> __m256i {
-		_mm256_and_si256(_mm256_loadu_si256(p as _), _mm256_cmpgt_epi8(_mm256_set1_epi8(rem.min(32) as i8), _mm256_loadu_si256(IO.as_ptr() as _)))
-	}
-	// the n bytes at p equal the zero-padded bytes at s
+	// 64 ones, then 64 zeros: from 64-n, the mask of the first n bytes
+	static MK: [u8; 128] = {
+		let mut m = [0u8; 128];
+		let mut i = 0;
+		while i < 64 {
+			m[i] = 255;
+			i += 1;
+		}
+		m
+	};
+	// the n bytes at p equal the n bytes at s
 	#[inline(always)]
 	pub unsafe fn eq(p: *const u8, n: usize, s: *const u8) -> bool {
 		let mut k = 0;
 		while k < n {
-			let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block(p.add(k), n.saturating_sub(k)), _mm256_loadu_si256(s.add(k) as _)))
-				& _mm256_movemask_epi8(_mm256_cmpeq_epi8(block(p.add(k + 32), n.saturating_sub(k + 32)), _mm256_loadu_si256(s.add(k + 32) as _)));
-			if m != -1 {
+			let m = MK.as_ptr().add(64 - (n - k).min(64));
+			let d = |o: usize| _mm256_testz_si256(_mm256_xor_si256(_mm256_loadu_si256(p.add(k + o) as _), _mm256_loadu_si256(s.add(k + o) as _)), _mm256_loadu_si256(m.add(o) as _));
+			if d(0) & d(32) == 0 {
 				return false;
 			}
 			k += 64;
