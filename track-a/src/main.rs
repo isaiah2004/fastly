@@ -126,21 +126,24 @@ unsafe fn hour(s: *const u8) -> usize {
 // without branching (a line is over 32 bytes), so the line loop is predictable.
 #[inline(always)]
 unsafe fn lines(d: *const u8, mut s: usize, end: usize, mut f: impl FnMut(usize, usize)) {
-	let (mut ix, mut n, mut b) = ([0u32; CS / 32 + 32], 0, s);
+	let mut ix = std::mem::MaybeUninit::<[u32; CS / 32 + 32]>::uninit();
+	let (ix, mut n, mut b) = (ix.as_mut_ptr() as *mut u32, 0, s);
 	while b < end + 256 {
 		let mut m = v::mask(d.add(b), 10) as u64 | (v::mask(d.add(b + 32), 10) as u64) << 32;
-		ix[n] = (b + m.trailing_zeros() as usize) as u32;
+		let x = b + m.trailing_zeros() as usize;
+		*ix.add(n) = x as u32;
 		m &= m.wrapping_sub(1);
-		ix[n + 1] = (b + m.trailing_zeros() as usize) as u32;
-		n += (m != 0) as usize + (ix[n] < (b + 64) as u32) as usize;
+		*ix.add(n + 1) = (b + m.trailing_zeros() as usize) as u32;
+		n += (m != 0) as usize + (x < b + 64) as usize;
 		b += 64;
 	}
-	for &nl in &ix[..n] {
+	for i in 0..n {
 		if s >= end {
 			break;
 		}
-		f(s, nl as usize);
-		s = nl as usize + 1;
+		let nl = *ix.add(i) as usize;
+		f(s, nl);
+		s = nl + 1;
 	}
 }
 
@@ -158,9 +161,13 @@ unsafe fn nb(h: usize, c: (u32, u32), cx: &Cx) -> (u32, u32) {
 
 // the single pass: intern the endpoint, append the line's record to its hour
 unsafe fn pass(d: *const u8, p: usize, end: usize, l: &mut Loc, cx: &Cx) {
-	let (r, tb) = (cx.rec, &cx.tb);
+	let (r, tb, mut hk, mut h) = (cx.rec, &cx.tb, 0, 0);
 	lines(d, p, end, |p, nl| {
-		let h = hour(d.add(p));
+		// the hour of the line before, unless the month, day or hour bytes differ
+		let k = (d.add(p + 5) as *const u64).read_unaligned();
+		if k != hk {
+			(hk, h) = (k, hour(d.add(p)));
+		}
 		let es = ep_start(d, p);
 		let ls = v::lastsp(d.add(nl - 16));
 		let sp = nl - 16 + ls; // the space before the latency
@@ -181,7 +188,8 @@ unsafe fn pass(d: *const u8, p: usize, end: usize, l: &mut Loc, cx: &Cx) {
 // f(record, latency) for every line of hour h
 unsafe fn each(c: &Cx, h: usize, mut f: impl FnMut(u32, u32)) {
 	let (mut k, r) = (h * c.cap, c.rec);
-	while k < h * c.cap + c.top[h].load(Relaxed) {
+	let e = k + c.top[h].load(Relaxed);
+	while k < e {
 		let x = *r.add(k);
 		if x == FILL {
 			k = (k | (BLK - 1)) + 1;
