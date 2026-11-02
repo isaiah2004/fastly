@@ -71,14 +71,16 @@ impl Tab {
         }
     }
     // Keeps only the keys of terms longer than 12 bytes (the only ones lookups compare in full).
-    fn drop_keys(&mut self) {
+    // (by new id: nid[old id])
+    fn drop_keys(&mut self, nid: &[u32]) {
         self.long = self
             .keys
             .iter()
             .enumerate()
             .filter(|(_, k)| k[1] >> 32 != 0)
-            .map(|(i, k)| (i as u32, *k))
+            .map(|(i, k)| (nid[i], *k))
             .collect();
+        self.long.sort_unstable_by_key(|x| x.0);
         self.keys = Vec::new();
     }
     // New ids (nid[old]) with their flags (f[new]) in the top byte.
@@ -238,7 +240,7 @@ unsafe fn mask64(p: *const u8) -> (u64, u64) {
 
 // Tokens of the line that starts at p: pos gets the start and end of every maximal [A-Za-z0-9] run,
 // relative to p. Returns the length of the line with its newline.
-#[inline(always)]
+#[inline(never)]
 fn line_tokens(buf: &[u8], p: usize, pos: &mut Vec<u32>) -> usize {
     pos.clear();
     let (mut q, mut carry, mut n, mut o) = (p, 0u64, 0, pos.as_mut_ptr());
@@ -385,6 +387,7 @@ struct WOut {
     pm: Vec<(u32, u32)>,
 }
 
+#[inline(never)]
 fn finish(
     c: &Ctx,
     doc: u32,
@@ -452,7 +455,40 @@ impl W {
             }
         }
     }
+    // The lookup entries of the line at p (token bounds in pos, the doc id first) into ks.
+    #[inline(never)]
+    fn keys(&mut self, c: &Ctx, buf: &[u8], p: usize, np: usize) {
+        self.ks.clear();
+        self.ks.reserve(np + PD);
+        let (ks, pp) = (self.ks.as_mut_ptr(), self.pos.as_ptr());
+        for j in 1..np {
+            let (s, e) = unsafe { (p + *pp.add(2 * j) as usize, p + *pp.add(2 * j + 1) as usize) };
+            let len = e - s;
+            let ent = if len <= 12 {
+                let (k0, k1) = load12(buf, s, len);
+                (k0, k1, h12(k0, k1))
+            } else {
+                (
+                    if len <= 32 {
+                        c.tab.get(&load_key(buf, s, len))
+                    } else {
+                        c.dummy
+                    } as u64,
+                    u32::MAX,
+                    0,
+                )
+            };
+            unsafe { ks.add(j - 1).write(ent) };
+        }
+        unsafe {
+            for j in 0..PD {
+                ks.add(np - 1 + j).write((0, 0, 0)); // prefetch padding
+            }
+            self.ks.set_len(np - 1);
+        }
+    }
     // All tokens of one document are in ks: hash and prefetch first, then look up and index.
+    #[inline(never)]
     fn doc(&mut self, c: &Ctx, doc: u32) {
         let n = self.ks.len();
         self.ids.clear();
@@ -618,36 +654,7 @@ fn worker(c: &Ctx, bounds: &[usize]) -> Vec<WOut> {
                 if np > 0 {
                     let pos = &w.pos;
                     doc = parse_u32(&buf[p + pos[0] as usize..p + pos[1] as usize]);
-                    w.ks.clear();
-                    w.ks.reserve(np + PD);
-                    let (ks, pp) = (w.ks.as_mut_ptr(), pos.as_ptr());
-                    for j in 1..np {
-                        let (s, e) = unsafe {
-                            (p + *pp.add(2 * j) as usize, p + *pp.add(2 * j + 1) as usize)
-                        };
-                        let len = e - s;
-                        let ent = if len <= 12 {
-                            let (k0, k1) = load12(buf, s, len);
-                            (k0, k1, h12(k0, k1))
-                        } else {
-                            (
-                                if len <= 32 {
-                                    c.tab.get(&load_key(buf, s, len))
-                                } else {
-                                    c.dummy
-                                } as u64,
-                                u32::MAX,
-                                0,
-                            )
-                        };
-                        unsafe { ks.add(j - 1).write(ent) };
-                    }
-                    unsafe {
-                        for j in 0..PD {
-                            ks.add(np - 1 + j).write((0, 0, 0)); // prefetch padding
-                        }
-                        w.ks.set_len(np - 1);
-                    }
+                    w.keys(c, buf, p, np);
                     w.doc(c, doc);
                 }
                 p += len;
@@ -1015,27 +1022,26 @@ fn main() {
     // BOOL terms in more than 1/40 of the sample get a bitmap, the other ones a sorted list.
     // Renumber: bitmap terms first (bitmap index = id), then by sampled frequency so hot data shares cache lines.
     let isbm = |t: usize| is_bool_term[t] && sdf[t] as u64 * 40 >= sdocs as u64;
-    let mut pk: Vec<u64> = (0..nt)
-        .map(|t| {
-            ((!isbm(t) as u64) << 63
-                | (!is_bool_term[t] as u64) << 62
-                | ((u32::MAX - sdf[t]) as u64) << 24)
-                | t as u64
-        })
-        .collect();
-    pk.sort_unstable();
-    let perm: Vec<u32> = pk.iter().map(|&x| (x & 0xFF_FFFF) as u32).collect();
-    let nbm = (0..nt).filter(|&t| isbm(t)).count();
-    let mut nid = vec![0u32; nt];
-    perm.iter()
-        .enumerate()
-        .for_each(|(n, &o)| nid[o as usize] = n as u32);
-    tab.keys = perm.iter().map(|&o| tab.keys[o as usize]).collect();
+    // (stable counting sort by group, then by sampled frequency, descending)
+    let mx = *sdf.iter().max().unwrap_or(&0) as usize + 1;
+    let bk =
+        |t: usize| (!isbm(t) as usize + !is_bool_term[t] as usize) * mx + mx - 1 - sdf[t] as usize;
+    let mut cnt = vec![0u32; 3 * mx + 1];
+    (0..nt).for_each(|t| cnt[bk(t) + 1] += 1);
+    (1..cnt.len()).for_each(|i| cnt[i] += cnt[i - 1]);
+    let (mut perm, mut nid) = (vec![0u32; nt], vec![0u32; nt]);
+    for t in 0..nt {
+        let b = bk(t);
+        (nid[t], perm[cnt[b] as usize]) = (cnt[b], t as u32);
+        cnt[b] += 1;
+    }
+    let nbm = cnt[mx - 1] as usize;
     let lens: Vec<u32> = tab
         .keys
         .iter()
         .map(|k| k.iter().map(|w| 8 - w.leading_zeros() / 8).sum())
         .collect();
+    let lens: Vec<u32> = perm.iter().map(|&o| lens[o as usize]).collect();
     let is_bool_term: Vec<bool> = perm.iter().map(|&o| is_bool_term[o as usize]).collect();
     let sdf: Vec<u32> = perm.iter().map(|&o| sdf[o as usize]).collect();
     ops.iter_mut().for_each(|o| o.1 = nid[o.1 as usize]);
@@ -1073,7 +1079,7 @@ fn main() {
         kcnt[t] += 1;
     }
     tab.renumber(&nid, &flags);
-    tab.drop_keys();
+    tab.drop_keys(&nid);
     // Rounds of 65536 docs: index a round, answer every BOOL query on it, add up the results. Only
     // one round's index is alive at a time; within a round doc ids are their low 16 bits.
     let rd = 1 << 16; // docs per round
