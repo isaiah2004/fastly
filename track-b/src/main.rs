@@ -302,7 +302,9 @@ fn load(path: &str) -> &'static [u8] {
             }
         }
     }
-    let mut v = std::fs::read(path).unwrap();
+    let mut f = std::fs::File::open(path).unwrap();
+    let mut v = Vec::with_capacity(f.metadata().unwrap().len() as usize + 64);
+    std::io::Read::read_to_end(&mut f, &mut v).unwrap();
     v.resize(v.len() + 64, 0);
     let n = v.len() - 64;
     &Box::leak(v.into_boxed_slice())[..n]
@@ -347,6 +349,7 @@ struct Ctx<'a> {
     ew: usize, // bytes per stream entry: 2, or 3 when there are 65535 list terms or morelo + nl
     nl: usize,
     buf: &'a [u8],
+    docs: String, // path of docs.txt (workers read their ranges with pread)
     tab: Tab,
     bm: Ptr<u64>, // bitmaps of the current round: row t (w words) has bit d - d0 for doc d
     d0: u32,
@@ -550,9 +553,27 @@ impl W {
 }
 
 // Index the docs from bounds[0] to the last bound, one output per pair of bounds (at most 32768 docs).
+// Reads b.len() bytes of f at offset off.
+fn read_at(f: &std::fs::File, b: &mut [u8], off: usize) {
+    #[cfg(unix)]
+    std::os::unix::fs::FileExt::read_exact_at(f, b, off as u64).unwrap();
+    #[cfg(windows)]
+    {
+        let mut d = 0;
+        while d < b.len() {
+            d +=
+                std::os::windows::fs::FileExt::seek_read(f, &mut b[d..], (off + d) as u64).unwrap();
+        }
+    }
+}
+
 fn worker(c: &Ctx, bounds: &[usize]) -> Vec<WOut> {
-    let buf = c.buf;
     let nt = c.nl;
+    // the bytes are read in chunks into a small reused buffer (cheaper than faulting in a mapping)
+    let (file, mut ch) = (
+        std::fs::File::open(&c.docs).unwrap(),
+        vec![0u8; (1 << 16) + 64],
+    );
     let mut w = W {
         lc: hvec(nt, [0, 0]),
         lastpm: vec![MISS; c.p_off.len() - 1],
@@ -568,46 +589,71 @@ fn worker(c: &Ctx, bounds: &[usize]) -> Vec<WOut> {
         }
         let mut doc;
         w.lc.fill([u16::MAX, 0]);
-        w.base = parse_u32(&buf[a..a + buf[a..].iter().position(|&c| c == b'\t').unwrap()]);
-        let mut p = a;
-        while p < b {
-            let len = line_tokens(buf, p, &mut w.pos);
-            let np = w.pos.len() / 2;
-            if np > 0 {
-                let pos = &w.pos;
-                doc = parse_u32(&buf[p + pos[0] as usize..p + pos[1] as usize]);
-                w.ks.clear();
-                w.ks.reserve(np + PD);
-                let (ks, pp) = (w.ks.as_mut_ptr(), pos.as_ptr());
-                for j in 1..np {
-                    let (s, e) =
-                        unsafe { (p + *pp.add(2 * j) as usize, p + *pp.add(2 * j + 1) as usize) };
-                    let len = e - s;
-                    let ent = if len <= 12 {
-                        let (k0, k1) = load12(buf, s, len);
-                        (k0, k1, h12(k0, k1))
-                    } else {
-                        (
-                            if len <= 32 {
-                                c.tab.get(&load_key(buf, s, len))
-                            } else {
-                                c.dummy
-                            } as u64,
-                            u32::MAX,
-                            0,
-                        )
-                    };
-                    unsafe { ks.add(j - 1).write(ent) };
-                }
-                unsafe {
-                    for j in 0..PD {
-                        ks.add(np - 1 + j).write((0, 0, 0)); // prefetch padding
-                    }
-                    w.ks.set_len(np - 1);
-                }
-                w.doc(c, doc);
+        w.base = parse_u32(&c.buf[a..a + c.buf[a..].iter().position(|&c| c == b'\t').unwrap()]);
+        let (mut off, mut keep) = (a, 0);
+        while off < b {
+            let n = (ch.len() - 64 - keep).min(b - off);
+            read_at(&file, &mut ch[keep..keep + n], off);
+            off += n;
+            let valid = keep + n;
+            // whole lines only (the window ends at a line end); 64 readable bytes follow them
+            let end = if off == b {
+                valid
+            } else {
+                ch[..valid]
+                    .iter()
+                    .rposition(|&x| x == b'\n')
+                    .map_or(0, |i| i + 1)
+            };
+            if end == 0 {
+                ch.resize(ch.len() * 2, 0); // a line longer than the buffer
+                keep = valid;
+                continue;
             }
-            p += len;
+            let buf = &ch[..end];
+            let mut p = 0;
+            while p < end {
+                let len = line_tokens(buf, p, &mut w.pos);
+                let np = w.pos.len() / 2;
+                if np > 0 {
+                    let pos = &w.pos;
+                    doc = parse_u32(&buf[p + pos[0] as usize..p + pos[1] as usize]);
+                    w.ks.clear();
+                    w.ks.reserve(np + PD);
+                    let (ks, pp) = (w.ks.as_mut_ptr(), pos.as_ptr());
+                    for j in 1..np {
+                        let (s, e) = unsafe {
+                            (p + *pp.add(2 * j) as usize, p + *pp.add(2 * j + 1) as usize)
+                        };
+                        let len = e - s;
+                        let ent = if len <= 12 {
+                            let (k0, k1) = load12(buf, s, len);
+                            (k0, k1, h12(k0, k1))
+                        } else {
+                            (
+                                if len <= 32 {
+                                    c.tab.get(&load_key(buf, s, len))
+                                } else {
+                                    c.dummy
+                                } as u64,
+                                u32::MAX,
+                                0,
+                            )
+                        };
+                        unsafe { ks.add(j - 1).write(ent) };
+                    }
+                    unsafe {
+                        for j in 0..PD {
+                            ks.add(np - 1 + j).write((0, 0, 0)); // prefetch padding
+                        }
+                        w.ks.set_len(np - 1);
+                    }
+                    w.doc(c, doc);
+                }
+                p += len;
+            }
+            ch.copy_within(end..valid, 0);
+            keep = valid - end;
         }
         // local counting sort of the stream (small enough to stay in cache)
         let mut offs = Vec::with_capacity(nt + 1);
@@ -1042,6 +1088,7 @@ fn main() {
         ew: if nbool - nbm < 65535 { 2 } else { 3 },
         nl: nbool - nbm,
         buf,
+        docs: format!("{data}/docs.txt"),
         tab,
         bm: Ptr(bmv.as_mut_ptr()),
         d0: 0,
