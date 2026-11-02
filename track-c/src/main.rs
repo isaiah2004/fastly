@@ -620,6 +620,9 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
         while rdone.load(Acquire) < RP {
             std::hint::spin_loop();
         }
+        if ti == 0 {
+            unsafe { madvise(rd.as_ptr() as *mut u8, rd.len(), 4) }; // the regions file is parsed
+        }
         let mut st = St { agg: Box::new([AGG0; 256]), me: ti, out: vec![], free: vec![], nb: 0 };
         st.out = (0..nt).map(|_| cx.fresh(&mut st)).collect();
         for i in std::iter::from_fn(|| Some(next.fetch_add(1, Relaxed))).take_while(|&i| i < nch) {

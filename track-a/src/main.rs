@@ -5,8 +5,8 @@ use std::{fs::File, os::unix::fs::FileExt, sync::Barrier, sync::Mutex};
 const H: usize = 72; // hours in the fixed window
 const NE: usize = 2048; // max distinct endpoints (the catalogue has 1,842)
 const TS: usize = 4096; // intern table slots
-const CS: usize = 2 << 20; // input chunk
-const PAD: usize = 512; // readable bytes past a chunk: its last line (under 200 bytes) and the SIMD reads past a line start
+const CS: usize = 64 << 10; // input chunk, read into a buffer that stays in L2
+const PAD: usize = 512; // read past a chunk: its last line (under 200 bytes) and the SIMD reads past a line start
 const BLK: usize = 512; // records per block
 const ESC: u32 = 0xfffff; // latency field value: the latency is in the next record
 const FILL: u32 = u32::MAX; // unused tail of a block
@@ -218,7 +218,6 @@ extern "C" {
 	fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
 	fn madvise(a: *const u8, l: usize, adv: i32) -> i32;
 	fn mallopt(p: i32, v: i32) -> i32;
-	fn munmap(a: *const u8, l: usize) -> i32;
 }
 
 // n bytes of address space; only the 4 KB pages written are charged
@@ -235,7 +234,7 @@ fn arena(n: usize) -> *mut u8 {
 unsafe fn free(p: *const u8, n: usize) { madvise(p, (n + 4095) & !4095, 4); }
 
 struct Cx {
-	buf: *const u8, // the log, mapped, then zeros
+	inp: File,
 	len: usize,
 	file: File,
 	bar: Barrier,
@@ -253,15 +252,19 @@ unsafe impl Sync for Cx {}
 unsafe fn work(t: usize, c: &Cx) {
 	let (len, tb) = (c.len, &c.tb);
 	let l = &mut [(0, 0); H];
-	// chunks of CS bytes handed out dynamically, each populated by its thread; a chunk owns the lines that start in it
+	// chunks of CS bytes handed out dynamically; a chunk owns the lines that start in it. It is read from the
+	// byte before it to PAD past it.
+	let mut w = vec![0u8; CS + 2 * PAD];
 	loop {
 		let a = c.nx[1].fetch_add(CS, Relaxed);
 		if a >= len {
 			break;
 		}
-		let x = if a == 0 { 0 } else { a + (a - 1..).position(|i| *c.buf.add(i) == b'\n').unwrap() };
-		madvise(c.buf.add(a), CS.min(len - a), 22); // MADV_POPULATE_READ
-		pass(c.buf, x, (a + CS).min(len), l, c);
+		let o = a.saturating_sub(1);
+		let k = (a + CS + PAD).min(len) - o;
+		c.inp.read_exact_at(&mut w[..k], o as u64).unwrap();
+		let x = if a == 0 { 0 } else { w.iter().position(|&b| b == b'\n').unwrap() + 1 };
+		pass(w.as_ptr(), x, (a + CS).min(len) - o, l, c);
 	}
 	for &(p, e) in l.iter() {
 		if p < e {
@@ -269,9 +272,6 @@ unsafe fn work(t: usize, c: &Cx) {
 		}
 	}
 	c.bar.wait();
-	if t == 0 {
-		munmap(c.buf, len); // here rather than at exit, overlapped with the other threads' work
-	}
 	// endpoint ids in byte order (each thread sorts its own copy)
 	let nm = |g: usize| {
 		let s = tb.gs[g].load(Relaxed) as usize;
@@ -361,16 +361,11 @@ fn main() {
 	let arg = |k: &str, d: &str| a.iter().position(|x| x == k).map_or(d.to_string(), |i| a[i + 1].clone());
 	let inp = File::open(arg("--data", "/data") + "/requests.log").unwrap();
 	let len = inp.metadata().unwrap().len() as usize;
-	// the file mapped over zeroed address space, so reads past its end are zeros
-	let buf = arena(len + 2 * PAD) as *const u8;
-	if len > 0 {
-		unsafe { mmap(buf as _, len, 1, 0x12, std::os::fd::AsRawFd::as_raw_fd(&inp), 0) }; // PRIVATE | FIXED
-	}
 	let file = File::create(arg("--out", "/out") + "/summary.txt").unwrap();
 	let nt = std::thread::available_parallelism().map_or(1, |n| n.get());
 	let cap = (2 * (len / 39 + nt) / (BLK - 1) + (H + 1) * nt + 1) / 2 * 2 * BLK; // records, at most 2 per line, plus partial blocks; whole pages
 	let c = Cx {
-		buf,
+		inp,
 		len,
 		file,
 		bar: Barrier::new(nt),

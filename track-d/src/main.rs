@@ -320,19 +320,6 @@ fn par<R: Send>(nt: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     out.into_iter().map(|x| x.unwrap()).collect()
 }
 
-/// Counts -> exclusive prefix sums, in place (c has n + 1 slots, the last one 0).
-fn prefix(c: &mut [u32], nt: usize) {
-    let (n, cp) = (c.len(), P(c.as_mut_ptr()));
-    let rg = |t: usize| n * t / nt..n * (t + 1) / nt;
-    let sums = par(nt, |t| rg(t).map(|i| *cp.at(i)).sum::<u32>());
-    par(nt, |t| {
-        let mut s: u32 = sums[..t].iter().sum();
-        for i in rg(t) {
-            (*cp.at(i), s) = (s, s + *cp.at(i));
-        }
-    });
-}
-
 /// Per-thread edge buckets: each bucket is a chain of BLK-entry blocks cut from a
 /// few big slabs, so thousands of buckets cost a handful of allocations.
 const BLK: usize = 512;
@@ -728,11 +715,6 @@ fn main() {
     let mut p = 0;
     let n = num(gb, &mut p) as usize;
     let _m = num(gb, &mut p);
-    // Rows are split into nt equal ranges; thread t owns rows los[t]..los[t + 1], so
-    // counting and scattering need no atomics.
-    let mul = ((nt as u64) << 32) / n as u64;
-    let own = |x: u32| ((x as u64 * mul) >> 32) as usize;
-    let los: Vec<usize> = (0..=nt).map(|t| (((t as u64) << 32).div_ceil(mul) as usize).min(n)).collect();
     let ch = chunks(gb, p, nt);
     // g0 is built from buckets of ns = nt * SUB row slots (thread t handles slots
     // t * SUB .. (t + 1) * SUB one at a time, so its scattered writes stay in cache).
@@ -870,73 +852,71 @@ fn main() {
         }));
     }
     drop(tag);
-    // reverse graph: edges whose head another thread owns are handed over in lists
+    // reverse graph, thread-local: thread t owns its own BFS segment nb0[t]..nb0[t + 1].
+    // Packed edges never leave their segment, so only escaped edges (~4%) can cross;
+    // those go over in lists of (head, tail, weight). Each thread counts into, prefixes
+    // and fills its own window of roff; escapes are counted first so their indices are final.
+    let seg = |v: u32| nb0.partition_point(|&b| b <= v as usize) - 1;
     let mut roff = vec![0u32; n + 1];
     let rp = P(roff.as_mut_ptr());
-    // cross[t][o]: (head, tail, fwd edge index) for edges whose head thread o owns
-    let cross: Vec<Vec<Vec<[u32; 3]>>> = par(nt, |t| {
-        let mut cr = vec![Vec::new(); nt];
-        for u in los[t]..los[t + 1] {
+    let cross = par(nt, |t| {
+        let (mut cr, mut xc) = (vec![Vec::new(); nt], vec![0u32; nt]);
+        for u in nb0[t]..nb0[t + 1] {
             for k in fwd.row(u) {
-                let v = fwd.edge(u as u32, k).0;
-                if own(v) == t {
+                let (v, w) = fwd.edge(u as u32, k);
+                let o = if fwd.e[k] & ESC == 0 { t } else { seg(v) };
+                xc[o] += enc(v, u as u32, w as u32).is_none() as u32;
+                if o == t {
                     *rp.at(v as usize) += 1;
                 } else {
-                    cr[own(v)].push([v, u as u32, k as u32]);
+                    cr[o].push([v, u as u32, w as u32]);
                 }
             }
         }
-        cr
+        (cr, xc)
     });
-    par(nt, |t| {
-        for x in cross.iter().flat_map(|c| &c[t]) {
-            *rp.at(x[0] as usize) += 1;
-        }
-    });
-    prefix(&mut roff, nt);
+    let (mut rb, mut xb) = (vec![0u32], vec![0u32]);
+    for t in 0..nt {
+        let inc = cross.iter().map(|x| x.0[t].len()).sum::<usize>() as u32;
+        rb.push(rb[t] + inc + roff[nb0[t]..nb0[t + 1]].iter().sum::<u32>());
+        xb.push(xb[t] + cross.iter().map(|x| x.1[t]).sum::<u32>());
+    }
     let mut re: Vec<u32> = uninit(m);
     let ep = P(re.as_mut_ptr());
     let rx = par(nt, |t| {
-        let base = los[t];
-        let mut cur = roff[base..los[t + 1]].to_vec();
         let mut ext = Vec::new();
-        let mut put = |v: u32, u: u32, k: usize| {
-            let c = &mut cur[v as usize - base];
-            let w = fwd.edge(u, k).1 as u32;
-            let x = enc(v, u, w).unwrap_or_else(|| {
+        for x in cross.iter().flat_map(|c| &c.0[t]) {
+            *rp.at(x[0] as usize) += 1;
+        }
+        // inclusive prefix: each row is then filled from its end down to its start
+        let mut s = rb[t];
+        for v in nb0[t]..nb0[t + 1] {
+            s += *rp.at(v);
+            *rp.at(v) = s;
+        }
+        let mut put = |v: u32, u: u32, w: u32| {
+            let c = rp.at(v as usize);
+            *c -= 1;
+            *ep.at(*c as usize) = enc(v, u, w).unwrap_or_else(|| {
                 ext.push((u, w));
-                ESC | (ext.len() - 1) as u32
+                ESC | (xb[t] + ext.len() as u32 - 1)
             });
-            *ep.at(*c as usize) = x;
-            *c += 1;
         };
-        for u in base..los[t + 1] {
+        for u in nb0[t]..nb0[t + 1] {
             for k in fwd.row(u) {
-                let v = fwd.edge(u as u32, k).0;
-                if own(v) == t {
-                    put(v, u as u32, k);
+                let (v, w) = fwd.edge(u as u32, k);
+                if fwd.e[k] & ESC == 0 || seg(v) == t {
+                    put(v, u as u32, w as u32);
                 }
             }
         }
-        for x in cross.iter().flat_map(|c| &c[t]) {
-            put(x[0], x[1], x[2] as usize);
+        for x in cross.iter().flat_map(|c| &c.0[t]) {
+            put(x[0], x[1], x[2]);
         }
         ext
     });
+    roff[n] = m as u32;
     drop(cross);
-    // thread-local escape indices -> global
-    let mut xb = vec![0u32];
-    for x in &rx {
-        xb.push(xb.last().unwrap() + x.len() as u32);
-    }
-    par(nt, |t| {
-        for k in roff[los[t]] as usize..roff[los[t + 1]] as usize {
-            let x = ep.at(k);
-            if *x & ESC != 0 {
-                *x += xb[t];
-            }
-        }
-    });
     let bwd = Cg { off: Off::new(&roff, nt), e: re, ext: rx.concat() };
     drop(roff);
 
