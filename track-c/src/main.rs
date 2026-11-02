@@ -39,13 +39,13 @@ fn map(path: &str) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(p, n) }
 }
 /// Zeroed memory; if `huge`, 2 MiB aligned with transparent huge pages requested (fewer TLB misses
-/// on random access; only worth it for tables that fill whole huge pages).
+/// on random access; only worth it for tables that fill whole huge pages), else refused (MADV_NOHUGEPAGE).
 fn zalloc(n: usize, huge: bool) -> *mut u8 {
     let m = if huge { (1 << 21) - 1 } else { 0 };
     let p = unsafe { mmap(null_mut(), n + m, 3, 0x22, -1, 0) };
     assert!(p as isize != -1, "mmap");
     let a = ((p as usize + m) & !m) as *mut u8;
-    unsafe { madvise(a, n, if huge { 14 } else { 0 }) };
+    unsafe { madvise(a, n, if huge { 14 } else { 15 }) };
     a
 }
 
