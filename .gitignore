@@ -1,0 +1,8 @@
+# local working dirs (not part of the submission)
+/spec/
+/starter/
+/data/
+target/
+*.log
+.out/
+data/

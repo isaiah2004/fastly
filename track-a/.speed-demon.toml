@@ -1,0 +1,5 @@
+# Read by the board and the scoring harness.
+track = "a"
+team = "3pi4"
+language = "Python"
+dependency_count = 0
