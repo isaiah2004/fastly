@@ -77,6 +77,30 @@ mod v {
 		let d = |o: usize| _mm256_testz_si256(_mm256_xor_si256(_mm256_loadu_si256(p.add(o) as _), _mm256_loadu_si256(s.add(o) as _)), _mm256_loadu_si256(m.add(o) as _));
 		d(0) & d(32) != 0 && (n <= 64 || d(64) & d(96) != 0)
 	}
+	// the k-th smallest (from 0) of v (at most 8M values) for each k: the largest value with fewer than k+1 values below it
+	#[inline(always)]
+	pub unsafe fn rk<const M: usize>(v: &[u32], ks: [usize; 3]) -> [u32; 3] {
+		let mut a = [u32::MAX; 64];
+		a[..v.len()].copy_from_slice(v);
+		let (ld, sg) = (|i: usize| _mm256_loadu_si256(a.as_ptr().add(8 * i) as _), _mm256_set1_epi32(i32::MIN));
+		let x: [__m256i; M] = std::array::from_fn(|i| _mm256_xor_si256(ld(i), sg));
+		let mut c = [_mm256_setzero_si256(); M];
+		for &y in v {
+			let b = _mm256_set1_epi32((y ^ 1 << 31) as i32);
+			for i in 0..M {
+				c[i] = _mm256_sub_epi32(c[i], _mm256_cmpgt_epi32(x[i], b));
+			}
+		}
+		ks.map(|k| {
+			let mut m = _mm256_setzero_si256();
+			for i in 0..M {
+				m = _mm256_max_epu32(m, _mm256_and_si256(_mm256_cmpgt_epi32(_mm256_set1_epi32(k as i32 + 1), c[i]), ld(i)));
+			}
+			let m = _mm_max_epu32(_mm256_castsi256_si128(m), _mm256_extracti128_si256(m, 1));
+			let m = _mm_max_epu32(m, _mm_shuffle_epi32(m, 0b1110));
+			_mm_cvtsi128_si32(_mm_max_epu32(m, _mm_shuffle_epi32(m, 1))) as u32
+		})
+	}
 	// index of the last space in the 16 bytes at p
 	#[inline(always)]
 	pub unsafe fn lastsp(p: *const u8) -> usize { 31 - (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p as _), _mm_set1_epi8(32))) as u32).leading_zeros() as usize }
@@ -308,13 +332,17 @@ unsafe fn work(t: usize, c: &Cx) {
 			let v = &mut v[off[id] as usize - n..off[id] as usize];
 			let r = |p: usize| (p * n + 99) / 100;
 			let (r50, r95, r99) = (r(50), r(95), r(99));
-			let ps = if n <= 20 {
-				v.sort_unstable();
-				[v[r50 - 1], v[r95 - 1], v[r99 - 1]]
-			} else {
+			let ks = [r50 - 1, r95 - 1, r99 - 1];
+			let ps = match n {
+				..=8 => v::rk::<1>(v, ks),
+				..=16 => v::rk::<2>(v, ks),
+				..=32 => v::rk::<4>(v, ks),
+				..=64 => v::rk::<8>(v, ks),
+				_ => {
 				let p50 = *v.select_nth_unstable(r50 - 1).1;
 				let p95 = *v[r50..].select_nth_unstable(r95 - 1 - r50).1;
 				[p50, p95, *v[r95..].select_nth_unstable(r99 - 1 - r95).1]
+				}
 			};
 			for b in [&hs[..], nm(id)] {
 				std::ptr::copy_nonoverlapping(b.as_ptr(), q, b.len());

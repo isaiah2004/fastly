@@ -13,7 +13,7 @@ Rust, standard library only, Linux and AVX2 (`target-cpu=x86-64-v3`). One scoped
    - The line becomes one `u32` record, `id<<21 | error<<20 | latency`, appended to the thread's current block for that hour. A latency of 2^20-1 or more is written as an escape value followed by the full latency in a second record (about 1% of lines). Each hour has its own region of a reserved (`MAP_NORESERVE`), small-page arena, and threads take 512-record blocks from it with an atomic counter.
 2. **Per hour (dynamic).** After a barrier, each thread sorts the ~1,842 endpoint ids by bytes for itself (no second barrier). Then each worker takes the next hour:
    - It walks the hour's region twice (count per endpoint, then scatter the latencies by endpoint rank into a per-thread array of about 170 KB that stays in L2), then releases the region with `MADV_DONTNEED`.
-   - It takes exact nearest-rank p50, p95 and p99 per group with `select_nth_unstable`: p50 on the whole group, p95 on the part above it, p99 on the part above that. Groups of 20 or fewer are sorted instead.
+   - It takes exact nearest-rank p50, p95 and p99 per group with `select_nth_unstable`: p50 on the whole group, p95 on the part above it, p99 on the part above that. Groups of 64 or fewer use no sort and no branches: the group is copied into a 64-entry AVX2 array padded with `u32::MAX`, each value's count of smaller values is built with one broadcast compare per value, and the k-th smallest is the largest value whose count is at most k. This removed about 40% of the run's branch mispredictions.
    - It formats the hour's lines (branch-free 2-digit LUT itoa) into the hour's slot of a reserved output area.
    - Offsets are assigned in hour order under a mutex. Whoever completes the next run of hours `pwrite`s them at their offsets and releases their pages, so threads write in parallel and the 10 MB output is never held in one buffer.
 
@@ -37,7 +37,7 @@ The build is profile-guided: `.cargo/config.toml` passes `-C profile-use=pgo.pro
 ## With another 24 hours
 
 - Hide the intern table's L2 latency at full thread count (prefetching helped one thread but not twelve).
-- A cheaper selection for the many groups of 20 to 200 lines.
+- A cheaper selection for the groups of 65 to 200 lines.
 
 ## November 2 direct-LF experiment
 
