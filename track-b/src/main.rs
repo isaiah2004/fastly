@@ -241,9 +241,13 @@ unsafe fn mask64(p: *const u8) -> (u64, u64) {
 #[inline(always)]
 fn line_tokens(buf: &[u8], p: usize, pos: &mut Vec<u32>) -> usize {
     pos.clear();
-    let (mut q, mut carry) = (p, 0u64);
+    let (mut q, mut carry, mut n, mut o) = (p, 0u64, 0, pos.as_mut_ptr());
     loop {
-        pos.reserve(72);
+        if n + 72 > pos.capacity() {
+            unsafe { pos.set_len(n) }; // keep what is written across the reallocation
+            pos.reserve(72);
+            o = pos.as_mut_ptr();
+        }
         let (mut m, nl) = if q + 64 <= buf.len() {
             unsafe { mask64(buf.as_ptr().add(q)) }
         } else {
@@ -258,9 +262,9 @@ fn line_tokens(buf: &[u8], p: usize, pos: &mut Vec<u32>) -> usize {
         // bits of t: token starts and ends (a run cut at the newline ends there)
         let mut t = m ^ (m << 1 | carry);
         carry = m >> 63;
-        let (off, cnt, n0) = ((q - p) as u32, t.count_ones() as usize, pos.len());
+        let (off, cnt) = ((q - p) as u32, t.count_ones() as usize);
         unsafe {
-            let o = pos.as_mut_ptr().add(n0);
+            let o = o.add(n);
             let mut k = 0;
             while k < cnt {
                 for u in 0..8 {
@@ -269,9 +273,10 @@ fn line_tokens(buf: &[u8], p: usize, pos: &mut Vec<u32>) -> usize {
                 }
                 k += 8;
             }
-            pos.set_len(n0 + cnt);
         }
+        n += cnt;
         if lim < 64 {
+            unsafe { pos.set_len(n) };
             return q - p + lim as usize + 1;
         }
         q += 64;
@@ -573,14 +578,10 @@ fn worker(c: &Ctx, bounds: &[usize]) -> Vec<WOut> {
                 doc = parse_u32(&buf[p + pos[0] as usize..p + pos[1] as usize]);
                 w.ks.clear();
                 w.ks.reserve(np + PD);
-                let ks = w.ks.as_mut_ptr();
+                let (ks, pp) = (w.ks.as_mut_ptr(), pos.as_ptr());
                 for j in 1..np {
-                    let (s, e) = unsafe {
-                        (
-                            p + *pos.get_unchecked(2 * j) as usize,
-                            p + *pos.get_unchecked(2 * j + 1) as usize,
-                        )
-                    };
+                    let (s, e) =
+                        unsafe { (p + *pp.add(2 * j) as usize, p + *pp.add(2 * j + 1) as usize) };
                     let len = e - s;
                     let ent = if len <= 12 {
                         let (k0, k1) = load12(buf, s, len);
