@@ -16,8 +16,10 @@ const AGG0: Agg = Agg(0, 0, 0, i64::MAX, i64::MIN, 0, 0);
 impl Agg {
     #[inline(always)]
     fn add(&mut self, o: &Agg) {
-        (self.0, self.1, self.2) = (self.0 + o.0, self.1.wrapping_add(o.1), self.2.wrapping_add(o.2));
-        (self.3, self.4, self.5, self.6) = (self.3.min(o.3), self.4.max(o.4), self.5 + o.5, self.6 + o.6);
+        // release builds have no overflow checks, so the sums wrap
+        (self.0, self.1, self.2) = (self.0 + o.0, self.1 + o.1, self.2 + o.2);
+        (self.3, self.4) = (self.3.min(o.3), self.4.max(o.4));
+        (self.5, self.6) = (self.5 + o.5, self.6 + o.6);
     }
 }
 
@@ -90,10 +92,14 @@ fn reg_new(rd: &[u8]) -> Option<Reg<'_>> {
     let last = &body[body.iter().rposition(|&b| b == b'\n')? + 1..];
     let max = Some(uint_sat(&last[..last.iter().position(|&b| b == b',')?]) as usize).filter(|&m| m < 1 << 28)?;
     let tbl = unsafe { std::slice::from_raw_parts(zalloc(max + 1, false) as *const AtomicU8, max + 1) };
-    let cidx = (0..26 * 26 * 26).map(|_| AtomicU8::new(0)).collect();
-    let codes = (0..256).map(|_| AtomicU32::new(0)).collect();
-    let (n, bad) = (AtomicUsize::new(0), AtomicBool::new(false));
-    Some(Reg { rd, tbl, cidx, codes, n, bad })
+    Some(Reg {
+        rd,
+        tbl,
+        cidx: (0..26 * 26 * 26).map(|_| AtomicU8::new(0)).collect(),
+        codes: (0..256).map(|_| AtomicU32::new(0)).collect(),
+        n: AtomicUsize::new(0),
+        bad: AtomicBool::new(false),
+    })
 }
 impl Reg<'_> {
     /// Parse the lines that start in the ti-th of nt slices; any line not of the form
@@ -117,7 +123,8 @@ impl Reg<'_> {
             let mut v = self.cidx[k].load(Relaxed);
             if v == 0 {
                 let n = self.n.fetch_add(1, Relaxed);
-                self.codes.get(n).filter(|_| n < UNM)?.store(u32::from_le_bytes([c[0], c[1], c[2], 0]), Relaxed);
+                let code = u32::from_le_bytes([c[0], c[1], c[2], 0]);
+                self.codes.get(n).filter(|_| n < UNM)?.store(code, Relaxed);
                 v = self.cidx[k].compare_exchange(0, n as u8 + 1, Relaxed, Relaxed).map_or_else(|x| x, |_| n as u8 + 1);
             }
             self.tbl[id].store(v, Relaxed);
@@ -168,7 +175,8 @@ fn at(d: &[u8], i: usize) -> u8 {
 fn hash_long(s: &[u8]) -> u64 {
     let (n, mut h, mut i) = (s.len(), 0x243F6A8885A308D3u64, 0);
     while i + 16 < n {
-        (h, i) = (mum(h ^ rd8(s, i), rd8(s, i + 8) ^ 0x13198A2E03707344), i + 16);
+        h = mum(h ^ rd8(s, i), rd8(s, i + 8) ^ 0x13198A2E03707344);
+        i += 16;
     }
     mum(h ^ rd8(s, n - 16), rd8(s, n - 8) ^ 0xA4093822299F31D0)
 }
@@ -298,18 +306,20 @@ struct Own {
 /// Bit masks of '"', ',' and LF in the 64 bytes at p.
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
-    let (a, b) = (_mm256_loadu_si256(p as *const __m256i), _mm256_loadu_si256(p.add(32) as *const __m256i));
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
     let m = |c: u8| {
         let s = _mm256_set1_epi8(c as i8);
-        let (x, y) = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, s)), _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, s)));
-        x as u32 as u64 | (y as u32 as u64) << 32
+        let x = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, s)) as u32 as u64;
+        x | (_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, s)) as u32 as u64) << 32
     };
     (m(b'"'), m(b','), m(b'\n'))
 }
 /// Bit i set iff an odd number of bits 0..=i of x are set (carry-less multiply by all ones).
 #[inline(always)]
 fn prefix_xor(x: u64) -> u64 {
-    unsafe { _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(_mm_set_epi64x(0, x as i64), _mm_set1_epi8(-1))) as u64 }
+    let c = unsafe { _mm_clmulepi64_si128::<0>(_mm_set_epi64x(0, x as i64), _mm_set1_epi8(-1)) };
+    unsafe { _mm_cvtsi128_si64(c) as u64 }
 }
 #[inline(always)]
 fn low(n: usize) -> u64 {
@@ -443,7 +453,7 @@ impl Ctx<'_> {
 fn flush(cx: &Ctx, st: &mut St, sg: &mut Stage) {
     for p in &sg.r[..sg.n] {
         let r = p.reg as usize;
-        let g = if r < cx.table.len() { cx.table[r].load(Relaxed).wrapping_sub(1) } else { UNM as u8 };
+        let g = cx.table.get(r).map_or(UNM as u8, |v| v.load(Relaxed).wrapping_sub(1));
         st.agg[g as usize].add(&Agg(1, p.id, p.c, p.c, p.c, p.nb as u64, p.tb as u64));
         let m = cx.names.msg(p.ko, p.kl as usize);
         let o = cx.names.owner(m[0]); // < nt = out.len()
@@ -472,7 +482,7 @@ fn record(cx: &Ctx, st: &mut St, sg: &mut Stage, rs: usize, f: &[usize; 5], q: u
     let (ko, kl) = if q > 0 { (f[0] + 2, nl.saturating_sub(2)) } else { (f[0] + 1, nl) };
     let nb = kl.saturating_sub(q.saturating_sub(2) / 2) as u64;
     let tl = f[2] - f[1] - 1;
-    let tb = if tq > 0 { tl.saturating_sub(2 + (tq - 2) / 2) } else { tl } as u64;
+    let tb = tl.saturating_sub(if tq > 0 { 2 + (tq - 2) / 2 } else { 0 }) as u64;
     let reg = num(d, f[2] + 1, f[3]).min(u32::MAX as u64) as usize;
     if reg < cx.table.len() {
         prefetch(&cx.table[reg]);
@@ -483,8 +493,7 @@ fn record(cx: &Ctx, st: &mut St, sg: &mut Stage, rs: usize, f: &[usize; 5], q: u
     let c = if e >= s + 4 + neg as usize && at(d, e - 3) == b'.' {
         let x = at(d, e - 2).wrapping_sub(b'0') as u64;
         let y = at(d, e - 1).wrapping_sub(b'0') as u64;
-        let v = (num(d, s + neg as usize, e - 3) * 100 + x * 10 + y) as i64;
-        if neg { -v } else { v }
+        (num(d, s + neg as usize, e - 3) * 100 + x * 10 + y) as i64 * if neg { -1 } else { 1 }
     } else {
         cents(d.get(s..e).unwrap_or(&[]))
     };
@@ -499,6 +508,7 @@ fn record(cx: &Ctx, st: &mut St, sg: &mut Stage, rs: usize, f: &[usize; 5], q: u
 }
 
 /// Separator (comma or LF outside quotes) positions, block by block, from a record start r0.
+#[derive(Default)]
 struct Scan<'a> {
     d: &'a [u8],
     e: usize,
@@ -556,9 +566,10 @@ impl Scan<'_> {
 /// Returns the number of quote bytes in [r0, e).
 fn parse_from(cx: &Ctx, st: &mut St, r0: usize, e: usize) -> u64 {
     let (d, len) = (cx.d, cx.d.len());
-    let mut sc = Scan { d, e, base: r0, s: 0, q: 0, qb: 0, cumq: 0, carry: 0, qe: 0 };
+    let mut sc = Scan { d, e, base: r0, ..Default::default() };
     sc.block();
-    let (mut rs, mut sg) = (r0, Stage { r: [Rec::default(); STAGE], n: 0 });
+    let mut sg = Stage { r: [Rec::default(); STAGE], n: 0 };
+    let mut rs = r0;
     while let Some(f0) = sc.next() {
         let q0 = sc.quotes(f0);
         let Some(f1) = sc.next() else { break };
@@ -568,8 +579,9 @@ fn parse_from(cx: &Ctx, st: &mut St, r0: usize, e: usize) -> u64 {
         let Some(f3) = sc.next() else { break };
         let Some(f4) = sc.next() else {
             // a final record without terminator ends at EOF (only if EOF is outside quotes)
+            let f = [f0, f1, f2, f3, len];
             if rs < e && rs < len && d[len - 1] != b'\n' && sc.carry == 0 {
-                record(cx, st, &mut sg, rs, &[f0, f1, f2, f3, len], q1 - q0, q2 - q1);
+                record(cx, st, &mut sg, rs, &f, q1 - q0, q2 - q1);
             }
             break;
         };
@@ -593,9 +605,8 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
     let len = d.len();
     let rg = reg_new(rd).filter(|_| len < u32::MAX as usize)?; // staged lengths are 32-bit
     let t = unsafe { std::slice::from_raw_parts(zalloc(NS * 64, true) as *const Line, NS) };
-    let overflow = AtomicBool::new(false);
     let tags = unsafe { std::slice::from_raw_parts(zalloc(NS, false) as *const AtomicU8, NS) };
-    let names = Names { d, t, tags, nt, overflow };
+    let names = Names { d, t, tags, nt, overflow: AtomicBool::new(false) };
     let stk = || Vec::from_iter((0..nt).map(|_| Stack(AtomicPtr::default())));
     let (inbox, spare) = (stk(), stk());
     // owner o has exactly the slots i with i * nt >> NB == o
@@ -643,7 +654,8 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
             // unmap the chunk's pages now, in parallel, instead of all at exit (MADV_DONTNEED; a later
             // read, e.g. of a record running past e, just maps the page again)
             let (a, b) = ((s + 4095) & !4095, e & !4095);
-            unsafe { madvise(d.as_ptr().wrapping_add(a) as *mut u8, b.saturating_sub(a), 4) };
+            let pa = d.as_ptr().wrapping_add(a) as *mut u8;
+            unsafe { madvise(pa, b.saturating_sub(a), 4) };
             cx.drain(ti, false);
         }
         (0..nt).for_each(|o| cx.post(&mut st, o));
@@ -733,17 +745,20 @@ fn slow(d: &[u8], rd: &[u8]) -> Rows {
 fn main() {
     // one malloc arena: worker threads allocate little, and per-thread arenas would inflate peak memory
     #[cfg(target_env = "gnu")]
-    unsafe { mallopt(-8, 1) };
+    let _ = unsafe { mallopt(-8, 1) };
     let args: Vec<String> = std::env::args().collect();
     let arg = |k: &str| Some(args[args.iter().position(|a| a == k)? + 1].clone());
     let data = arg("--data").unwrap_or("/data".into());
     let out = arg("--out").unwrap_or("/out".into());
     let cpus = std::thread::available_parallelism().map_or(12, |n| n.get());
-    let nt = arg("--threads").map_or(cpus, |t| t.parse().unwrap()).clamp(1, 256);
+    let nt: usize = arg("--threads").map_or(cpus, |t| t.parse().unwrap());
+    let nt = nt.clamp(1, 256);
     let nch = arg("--chunks").map_or(0, |c| c.parse().unwrap());
-    let (d, rd) = (map(&format!("{data}/records.csv")), map(&format!("{data}/regions.csv")));
+    let d = map(&format!("{data}/records.csv"));
+    let rd = map(&format!("{data}/regions.csv"));
     let slow_only = args.iter().any(|a| a == "--slow");
-    let mut rows = (!slow_only).then(|| fast(d, rd, nt, nch)).flatten().unwrap_or_else(|| {
+    let rows = (!slow_only).then(|| fast(d, rd, nt, nch)).flatten();
+    let mut rows = rows.unwrap_or_else(|| {
         eprintln!("note: exact sequential path");
         slow(d, rd)
     });
