@@ -1,74 +1,60 @@
-// Speed Demon 2026, Track A (Ingest). std only; AVX2 helpers with a scalar fallback.
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize as AU, Ordering::*};
-use std::{cell::UnsafeCell, fs::File, sync::Barrier};
+// Speed Demon 2026, Track A (Ingest). std only, Linux, AVX2 (built for x86-64-v3).
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize as AU, Ordering::*};
+use std::{fs::File, os::unix::fs::FileExt, sync::Barrier, sync::Mutex};
 
 const H: usize = 72; // hours in the fixed window
 const NE: usize = 2048; // max distinct endpoints (the catalogue has 1,842)
 const TS: usize = 4096; // intern table slots
-const PAD: usize = 256; // readable bytes needed past any line start
+const CS: usize = 64 << 10; // input chunk, read into a buffer that stays in L2
+const PAD: usize = 512; // read past a chunk: its last line (under 200 bytes) and the SIMD reads past a line start
+const BLK: usize = 512; // records per block
+const ESC: u32 = 0xfffff; // latency field value: the latency is in the next record
+const FILL: u32 = u32::MAX; // unused tail of a block
+const OC: usize = NE * 256; // output bytes per hour, at most: a line per endpoint
 
-// shared mutable state; phases are separated by barriers
-struct S<T>(UnsafeCell<T>);
-unsafe impl<T> Sync for S<T> {}
-impl<T> S<T> {
-	#[allow(clippy::mut_from_ref)]
-	fn g(&self) -> &mut T { unsafe { &mut *self.0.get() } }
-}
-fn s<T>(v: T) -> S<T> { S(UnsafeCell::new(v)) }
-
-#[derive(Default)]
-#[repr(align(128))] // no false sharing between threads
-struct Loc {
-	cnt: Vec<u64>, // [hour*NE + id]: count | errors<<32, later the scatter cursor
-	hm: u128,      // hours seen
-}
+// A record per line: id<<21 | error<<20 | latency, or ESC and then the latency. Threads append them to blocks of
+// BLK records in the hour's region; FILL ends a block early. Loc: per hour, a thread's write position and block end.
+type Loc = [(u32, u32); H];
 
 // endpoint intern table shared by all threads: slot = hash>>32<<32 | len<<16 | id+1; bytes in ent[slot]
 #[repr(align(64))]
 struct Ent([u8; 128]);
 struct Tab {
-	slot: Vec<Sl>,
+	slot: Vec<AtomicU64>,
 	ent: *mut Ent,
 	nid: AU,
 	gs: Vec<AtomicU32>, // id -> slot
-	dup: AtomicBool,    // two different endpoints share a full hash and length
 }
 
-#[repr(C, align(16))] // word and full hash share a cache line
-struct Sl(AtomicU64, AtomicU64);
 
-// endpoint id: probe from the hash; byte-compare when verifying (pass 1) or if hashes are not unique
+// endpoint id: probe from the hash, insert if new
 #[inline(always)]
-unsafe fn find(tb: &Tab, e: *const u8, n: usize, hv: u64, verify: bool) -> usize {
+unsafe fn find(tb: &Tab, e: *const u8, n: usize, hv: u64) -> usize {
 	let tag = hv >> 32 << 32 | (n as u64) << 16;
 	let mut s = hv as usize & (TS - 1);
 	loop {
 		let sl = tb.slot.get_unchecked(s);
-		let t = sl.0.load(Acquire);
-		if t >> 16 == tag >> 16 && sl.1.load(Relaxed) == hv {
-			if !verify || v::eq(e, n, (*tb.ent.add(s)).0.as_ptr()) {
+		let t = sl.load(Acquire);
+		if t >> 16 == tag >> 16 {
+			if v::eq(e, n, (*tb.ent.add(s)).0.as_ptr()) {
 				return (t & 0xffff) as usize - 1;
 			}
-			tb.dup.store(true, Relaxed);
-		} else if t == 0 {
-			if sl.0.compare_exchange(0, 1, Acquire, Relaxed).is_ok() {
+		} else if t <= 1 {
+			// empty, or another thread is inserting here
+			if t == 0 && sl.compare_exchange(0, 1, Acquire, Relaxed).is_ok() {
 				std::ptr::copy_nonoverlapping(e, (*tb.ent.add(s)).0.as_mut_ptr(), n);
 				let id = tb.nid.fetch_add(1, Relaxed);
-				assert!(id < NE);
+				assert!(id < NE - 1);
 				tb.gs[id].store(s as u32, Relaxed);
-				sl.1.store(hv, Relaxed);
-				sl.0.store(tag | (id as u64 + 1), Release);
+				sl.store(tag | (id as u64 + 1), Release);
 				return id;
 			}
 			continue;
-		} else if t == 1 {
-			continue; // another thread is inserting here
 		}
 		s = (s + 1) & (TS - 1);
 	}
 }
 
-#[cfg(target_feature = "avx2")]
 mod v {
 	use std::arch::x86_64::*;
 	#[inline(always)]
@@ -79,21 +65,11 @@ mod v {
 	unsafe fn block(p: *const u8, rem: usize) -> __m256i {
 		_mm256_and_si256(_mm256_loadu_si256(p as _), _mm256_cmpgt_epi8(_mm256_set1_epi8(rem.min(32) as i8), _mm256_loadu_si256(IO.as_ptr() as _)))
 	}
-	#[inline(always)]
-	pub unsafe fn hash(p: *const u8, n: usize) -> u64 {
-		let t = _mm256_and_si256(_mm256_loadu_si256(p.add(n).sub(32) as _), _mm256_cmpgt_epi8(_mm256_loadu_si256(IO.as_ptr() as _), _mm256_set1_epi8(31 - n as i8)));
-		let x = _mm256_xor_si256(block(p, n), _mm256_slli_epi64(t, 1));
-		let (a, b, c, d) = (_mm256_extract_epi64(x, 0) as u64, _mm256_extract_epi64(x, 1) as u64, _mm256_extract_epi64(x, 2) as u64, _mm256_extract_epi64(x, 3) as u64);
-		let h = (a ^ n as u64).wrapping_mul(0x9E3779B97F4A7C15)
-			^ b.wrapping_mul(0xC2B2AE3D27D4EB4F).rotate_left(21)
-			^ (c.wrapping_mul(0x165667B19E3779F9) ^ d.wrapping_mul(0xD6E8FEB86659FD93)).rotate_left(42);
-		h ^ (h >> 31)
-	}
 	// the n bytes at p equal the zero-padded bytes at s
 	#[inline(always)]
 	pub unsafe fn eq(p: *const u8, n: usize, s: *const u8) -> bool {
 		let mut k = 0;
-		while k < n.max(64) {
+		while k < n {
 			let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(block(p.add(k), n.saturating_sub(k)), _mm256_loadu_si256(s.add(k) as _)))
 				& _mm256_movemask_epi8(_mm256_cmpeq_epi8(block(p.add(k + 32), n.saturating_sub(k + 32)), _mm256_loadu_si256(s.add(k + 32) as _)));
 			if m != -1 {
@@ -117,13 +93,13 @@ mod v {
 	}
 }
 
-#[cfg(not(target_feature = "avx2"))]
-mod v {
-	pub unsafe fn mask(p: *const u8, c: u8) -> u32 { (0..32).fold(0, |m, i| m | ((*p.add(i) == c) as u32) << i) }
-	pub unsafe fn hash(p: *const u8, n: usize) -> u64 { (0..n).fold(n as u64, |h, i| (h ^ *p.add(i) as u64).wrapping_mul(0x100000001B3)).wrapping_mul(0x9E3779B97F4A7C15) }
-	pub unsafe fn eq(p: *const u8, n: usize, s: *const u8) -> bool { std::slice::from_raw_parts(p, n) == std::slice::from_raw_parts(s, n) }
-	pub unsafe fn lastsp(p: *const u8) -> usize { (0..16).rfind(|&i| *p.add(i) == b' ').unwrap() }
-	pub unsafe fn lat(p: *const u8, n: usize) -> u32 { (16 - n..16).fold(0, |v, k| v * 10 + (*p.add(k) - b'0') as u32) }
+// hash of the n endpoint bytes at p from its first, middle and last 8 (find compares the bytes)
+#[inline(always)]
+unsafe fn hash(p: *const u8, n: usize) -> u64 {
+	let r = |o: usize| (p.add(o) as *const u64).read_unaligned();
+	let (a, b, c) = if n >= 8 { (r(0), r((n - 8) / 2), r(n - 8)) } else { (r(0) & !(u64::MAX << (8 * n)), 0, 0) };
+	let h = (a ^ n as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ b.wrapping_mul(0xC2B2AE3D27D4EB4F).rotate_left(21) ^ c.wrapping_mul(0x165667B19E3779F9).rotate_left(42);
+	h ^ (h >> 29)
 }
 
 // endpoint start: the first '/' after the 27-byte timestamp and the method
@@ -141,64 +117,76 @@ unsafe fn hour(s: *const u8) -> usize {
 	(if *s.add(6) == b'1' { d + 1 } else { d - 30 }) * 24 + b(11) * 10 + b(12) - 18
 }
 
-// f(line start, newline) for each line starting in [s, end), walking a 64-byte newline bitmask; returns the next line start
+// f(line start, newline) for each line starting in [s, end). The newlines are listed first, two per 64 bytes
+// without branching (a line is over 32 bytes), so the line loop is predictable.
 #[inline(always)]
-unsafe fn lines(d: *const u8, mut s: usize, end: usize, mut f: impl FnMut(usize, usize)) -> usize {
-	let mut b = s;
-	while s < end {
+unsafe fn lines(d: *const u8, mut s: usize, end: usize, mut f: impl FnMut(usize, usize)) {
+	let (mut ix, mut n, mut b) = ([0u32; CS / 32 + 32], 0, s);
+	while b < end + 256 {
 		let mut m = v::mask(d.add(b), 10) as u64 | (v::mask(d.add(b + 32), 10) as u64) << 32;
-		while m != 0 {
-			let nl = b + m.trailing_zeros() as usize;
-			m &= m - 1;
-			f(s, nl);
-			s = nl + 1;
-			if s >= end {
-				return s;
-			}
-		}
+		ix[n] = (b + m.trailing_zeros() as usize) as u32;
+		m &= m.wrapping_sub(1);
+		ix[n + 1] = (b + m.trailing_zeros() as usize) as u32;
+		n += (m != 0) as usize + (ix[n] < (b + 64) as u32) as usize;
 		b += 64;
 	}
-	s
+	for &nl in &ix[..n] {
+		if s >= end {
+			break;
+		}
+		f(s, nl as usize);
+		s = nl as usize + 1;
+	}
 }
 
-// pass 1: intern endpoints, count lines and errors per (hour, endpoint)
-unsafe fn pass1(d: *const u8, p: usize, end: usize, l: &mut Loc, tb: &Tab) -> usize {
+// a new block for hour h
+#[cold]
+unsafe fn nb(h: usize, c: (u32, u32), cx: &Cx) -> (u32, u32) {
+	if c.0 < c.1 {
+		*cx.rec.add(c.0 as usize) = FILL;
+	}
+	let s = cx.top[h].fetch_add(BLK, Relaxed);
+	assert!(s + BLK <= cx.cap);
+	let s = h * cx.cap + s;
+	(s as u32, (s + BLK) as u32)
+}
+
+// the single pass: intern the endpoint, append the line's record to its hour
+unsafe fn pass(d: *const u8, p: usize, end: usize, l: &mut Loc, cx: &Cx) {
+	let (r, tb) = (cx.rec, &cx.tb);
 	lines(d, p, end, |p, nl| {
 		let h = hour(d.add(p));
 		let es = ep_start(d, p);
-		let sp = nl - 16 + v::lastsp(d.add(nl - 16)); // the space before the latency
-		let n = sp - 4 - es;
-		let id = find(tb, d.add(es), n, v::hash(d.add(es), n), true);
-		*l.cnt.get_unchecked_mut(h * NE + id) += 1 | ((*d.add(sp - 3) == b'5') as u64) << 32;
-		l.hm |= 1 << h;
-	})
-}
-
-// pass 2: find the endpoint again (read-only table) and scatter the latency into its group's slot
-unsafe fn pass2(d: *const u8, p: usize, end: usize, l: &mut Loc, tb: &Tab, lat: *mut u32) -> usize {
-	let dup = tb.dup.load(Relaxed);
-	lines(d, p, end, |p, nl| {
-		let es = ep_start(d, p);
 		let ls = v::lastsp(d.add(nl - 16));
-		let n = nl - 20 + ls - es;
-		let id = find(tb, d.add(es), n, v::hash(d.add(es), n), dup);
-		let c = l.cnt.get_unchecked_mut(hour(d.add(p)) * NE + id);
-		*lat.add(*c as usize) = v::lat(d.add(nl - 16), 15 - ls);
-		*c += 1;
+		let sp = nl - 16 + ls; // the space before the latency
+		let n = sp - 4 - es;
+		let id = find(tb, d.add(es), n, hash(d.add(es), n)) as u32;
+		let lat = v::lat(d.add(nl - 16), 15 - ls);
+		let mut c = *l.get_unchecked(h);
+		if c.0 + 2 > c.1 {
+			c = nb(h, c, cx);
+		}
+		*r.add(c.0 as usize) = id << 21 | ((*d.add(sp - 3) == b'5') as u32) << 20 | lat.min(ESC);
+		*r.add(c.0 as usize + 1) = lat;
+		c.0 += 1 + (lat >= ESC) as u32;
+		*l.get_unchecked_mut(h) = c;
 	})
 }
 
-// run f over the lines in [x, y); lines starting within PAD of the end of buf run on a padded copy
-fn chunk(buf: &[u8], x: usize, y: usize, mut f: impl FnMut(*const u8, usize, usize) -> usize) {
-	let p = f(buf.as_ptr(), x, y.min(buf.len().saturating_sub(PAD)));
-	if p < y {
-		let mut t = buf[p..y].to_vec();
-		t.resize(y - p + PAD, 0);
-		f(t.as_ptr(), 0, y - p);
+// f(record, latency) for every line of hour h
+unsafe fn each(c: &Cx, h: usize, mut f: impl FnMut(u32, u32)) {
+	let (mut k, r) = (h * c.cap, c.rec);
+	while k < h * c.cap + c.top[h].load(Relaxed) {
+		let x = *r.add(k);
+		if x == FILL {
+			k = (k | (BLK - 1)) + 1;
+			continue;
+		}
+		let esc = x & ESC == ESC;
+		f(x, if esc { *r.add(k + 1) } else { x & ESC });
+		k += 1 + esc as usize;
 	}
 }
-
-fn digits(v: u64) -> usize { (v.max(1).ilog10() + 1) as usize }
 
 const LUT: [u8; 200] = {
 	let mut t = [0u8; 200];
@@ -209,161 +197,121 @@ const LUT: [u8; 200] = {
 	}
 	t
 };
-// append " <v>"
-fn num(o: &mut Vec<u8>, mut v: u64) {
-	let (mut t, mut i) = ([b' '; 22], 22);
-	while v >= 10 {
-		let r = (v % 100) as usize * 2;
-		i -= 2;
-		t[i..i + 2].copy_from_slice(&LUT[r..r + 2]);
+// write " <v>" at q (and up to 15 bytes of scratch after it); returns the end. No branches.
+unsafe fn num(q: *mut u8, mut v: u32) -> *mut u8 {
+	let (n, mut t) = (v.max(1).ilog10() as usize + 1, [0u8; 32]);
+	for i in 0..5 {
+		std::ptr::copy_nonoverlapping(LUT.as_ptr().add(v as usize % 100 * 2), t.as_mut_ptr().add(14 - 2 * i), 2);
 		v /= 100;
 	}
-	if i == 22 || v > 0 {
-		i -= 1;
-		t[i] = b'0' + v as u8;
-	}
-	o.extend_from_slice(&t[i - 1..]);
+	t[15 - n] = b' ';
+	std::ptr::copy_nonoverlapping(t.as_ptr().add(15 - n), q, 16);
+	q.add(n + 1)
 }
 
-#[cfg(target_os = "linux")]
 extern "C" {
 	fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
 	fn madvise(a: *const u8, l: usize, adv: i32) -> i32;
+	fn mallopt(p: i32, v: i32) -> i32;
 }
 
-fn load(path: String) -> &'static [u8] {
-	#[cfg(target_os = "linux")]
+// n bytes of address space; only the 4 KB pages written are charged
+fn arena(n: usize) -> *mut u8 {
 	unsafe {
-		let f = File::open(path).unwrap();
-		let n = f.metadata().unwrap().len() as usize;
-		if n == 0 {
-			return &[];
-		}
-		return std::slice::from_raw_parts(mmap(std::ptr::null_mut(), n, 1, 2, std::os::fd::AsRawFd::as_raw_fd(&f), 0), n);
+		let p = mmap(std::ptr::null_mut(), n, 3, 0x4022, -1, 0); // RW, PRIVATE | ANONYMOUS | NORESERVE
+		assert!(p as isize != -1);
+		madvise(p, n, 15); // MADV_NOHUGEPAGE
+		p
 	}
-	#[cfg(not(target_os = "linux"))]
-	Box::leak(std::fs::read(path).unwrap().into_boxed_slice())
 }
 
-// the output file sized to n bytes and mapped for writing; else a buffer that ofin writes out
-static BUFD: AtomicBool = AtomicBool::new(false);
-fn omap(f: &File, n: usize) -> *mut u8 {
-	#[cfg(target_os = "linux")]
-	unsafe {
-		if n > 0 && f.set_len(n as u64).is_ok() {
-			let p = mmap(std::ptr::null_mut(), n, 3, 1, std::os::fd::AsRawFd::as_raw_fd(f), 0);
-			if p as isize != -1 {
-				return p;
-			}
-			f.set_len(0).unwrap();
-		}
-	}
-	let _ = f;
-	BUFD.store(true, Relaxed);
-	Box::leak(vec![0u8; n].into_boxed_slice()).as_mut_ptr()
-}
-fn ofin(mut f: &File, p: *mut u8, n: usize) {
-	if BUFD.load(Relaxed) {
-		std::io::Write::write_all(&mut f, unsafe { std::slice::from_raw_parts(p, n) }).unwrap();
-	}
-}
+// MADV_DONTNEED the pages of [p, p+n)
+unsafe fn free(p: *const u8, n: usize) { madvise(p, (n + 4095) & !4095, 4); }
 
 struct Cx {
-	buf: &'static [u8],
+	inp: File,
+	len: usize,
 	file: File,
-	nt: usize,
-	b: Vec<usize>,     // chunk bounds, at line starts
-	locs: Vec<S<Loc>>, // per thread
 	bar: Barrier,
 	tb: Tab,
-	ord: S<Vec<usize>>,           // rank -> endpoint id
-	names: S<Vec<&'static [u8]>>, // rank -> endpoint
-	goff: S<Vec<u32>>,            // group g = hour*E + rank -> first slot in lat; output order
-	gerr: S<Vec<u32>>,
-	st: S<Vec<[u32; 3]>>, // percentiles per group
-	lat: S<Vec<u32>>,
-	om: S<*mut u8>,
-	tot: Vec<AU>, // latencies per thread's hour range
-	hl: Vec<AU>,  // output bytes per hour, then offsets
-	nx: [AU; 2],  // next hour to hand out
+	rec: *mut u32, // H regions of cap records
+	val: *mut u32, // per thread: cap latencies, an hour's in endpoint order
+	txt: *mut u8,  // per hour: OC bytes of output
+	cap: usize,
+	top: Vec<AU>, // records used per region
+	nx: [AU; 2],                  // next hour, next input chunk
+	out: Mutex<(usize, usize, [usize; H])>, // next hour to place, its offset, formatted lengths (MAX: not yet)
 }
 unsafe impl Sync for Cx {}
 
 unsafe fn work(t: usize, c: &Cx) {
-	let (buf, nt, tb) = (c.buf, c.nt, &c.tb);
-	let (x, y) = (c.b[t], c.b[t + 1]);
-	let l = c.locs[t].g();
-	l.cnt = vec![0; NE * H];
-	#[cfg(target_os = "linux")]
-	madvise(buf.as_ptr().add(x & !4095), y - (x & !4095), 22); // MADV_POPULATE_READ, page tables in parallel
-	chunk(buf, x, y, |d, p, e| pass1(d, p, e, l, tb));
-	c.bar.wait();
-	if t == 0 {
-		// endpoints in byte order
-		let e = tb.nid.load(Relaxed);
-		let nm = |g: usize| {
-			let s = tb.gs[g].load(Relaxed) as usize;
-			&(&(*tb.ent.add(s)).0)[..(tb.slot[s].0.load(Relaxed) >> 16 & 255) as usize]
-		};
-		let o = c.ord.g();
-		*o = (0..e).collect();
-		o.sort_unstable_by(|&p, &q| nm(p).cmp(nm(q)));
-		*c.names.g() = o.iter().map(|&g| nm(g)).collect();
-		*c.goff.g() = vec![0; e * H + 1];
-		*c.gerr.g() = vec![0; e * H];
-		*c.st.g() = vec![[0; 3]; e * H];
+	let (len, tb) = (c.len, &c.tb);
+	let l = &mut [(0, 0); H];
+	// chunks of CS bytes handed out dynamically; a chunk owns the lines that start in it. It is read from the
+	// byte before it to PAD past it.
+	let mut w = vec![0u8; CS + 2 * PAD];
+	loop {
+		let a = c.nx[1].fetch_add(CS, Relaxed);
+		if a >= len {
+			break;
+		}
+		let o = a.saturating_sub(1);
+		let k = (a + CS + PAD).min(len) - o;
+		c.inp.read_exact_at(&mut w[..k], o as u64).unwrap();
+		let x = if a == 0 { 0 } else { w.iter().position(|&b| b == b'\n').unwrap() + 1 };
+		pass(w.as_ptr(), x, (a + CS).min(len) - o, l, c);
 	}
-	c.bar.wait();
-	// group offsets, two-phase prefix sum; this thread owns hours [h0, h1)
-	let e = c.names.g().len();
-	let (h0, h1) = (t * H / nt, (t + 1) * H / nt);
-	let act = |h: usize| (0..nt).filter(move |&u| c.locs[u].g().hm >> h & 1 != 0);
-	let sum = (h0..h1).flat_map(|h| act(h).flat_map(move |u| c.locs[u].g().cnt[h * NE..h * NE + e].iter())).map(|&v| v as u32 as usize).sum();
-	c.tot[t].store(sum, Relaxed);
-	c.bar.wait();
-	let mut run = (0..t).map(|u| c.tot[u].load(Relaxed)).sum::<usize>() as u64;
-	let (go, ge, od) = (c.goff.g(), c.gerr.g(), &c.ord.g()[..]);
-	for h in h0..h1 {
-		let us: Vec<usize> = act(h).collect();
-		for r in 0..e {
-			go[h * e + r] = run as u32;
-			let mut er = 0;
-			for &u in &us {
-				let v = c.locs[u].g().cnt.get_unchecked_mut(h * NE + od[r]);
-				er += *v >> 32;
-				(*v, run) = (run, run + (*v as u32 as u64));
-			}
-			ge[h * e + r] = er as u32;
+	for &(p, e) in l.iter() {
+		if p < e {
+			*c.rec.add(p as usize) = FILL;
 		}
 	}
-	if t == nt - 1 {
-		go[e * H] = run as u32;
-		let lv = c.lat.g();
-		*lv = Vec::with_capacity(run as usize);
-		lv.set_len(run as usize);
-	}
 	c.bar.wait();
-	let lp = c.lat.g().as_mut_ptr();
-	let l = c.locs[t].g();
-	chunk(buf, x, y, |d, p, e| pass2(d, p, e, l, tb, lp));
-	c.bar.wait();
-	// exact nearest-rank percentiles per group, and output bytes per hour
-	let (go, ge, nm, st) = (&c.goff.g()[..], &c.gerr.g()[..], &c.names.g()[..], c.st.g());
+	// endpoint ids in byte order (each thread sorts its own copy)
+	let nm = |g: usize| {
+		let s = tb.gs[g].load(Relaxed) as usize;
+		&(&(*tb.ent.add(s)).0)[..(tb.slot[s].load(Relaxed) >> 16 & 255) as usize]
+	};
+	let mut od: Vec<usize> = (0..tb.nid.load(Relaxed)).collect();
+	od.sort_unstable_by(|&p, &q| nm(p).cmp(nm(q)));
+	// per hour: count, scatter by endpoint rank, release the records, exact nearest-rank percentiles, format, write
+	let (mut cnt, mut off) = (vec![0u64; NE], vec![0u32; NE]); // cnt: count | errors<<32
 	loop {
 		let h = c.nx[0].fetch_add(1, Relaxed);
 		if h >= H {
 			break;
 		}
-		let mut bytes = 0;
-		for r in 0..e {
-			let g = h * e + r;
-			let (x, n) = (go[g] as usize, (go[g + 1] - go[g]) as usize);
+		cnt.fill(0);
+		each(c, h, |r, _| {
+			*cnt.get_unchecked_mut((r >> 21) as usize) += 1 | ((r >> 20 & 1) as u64) << 32;
+		});
+		let mut tot = 0;
+		for &id in &od {
+			off[id] = tot;
+			tot += cnt[id] as u32;
+		}
+		let v = std::slice::from_raw_parts_mut(c.val.add(t * c.cap), tot as usize);
+		each(c, h, |r, x| {
+			let k = off.get_unchecked_mut((r >> 21) as usize);
+			*v.get_unchecked_mut(*k as usize) = x;
+			*k += 1;
+		});
+		free(c.rec.add(h * c.cap) as _, c.top[h].load(Relaxed) * 4); // the hour's records are done
+		let ab = h + 18;
+		let mut hs = *b"2026-10-30T00:00:00Z ";
+		hs[..10].copy_from_slice([b"2026-10-30", b"2026-10-31", b"2026-11-01", b"2026-11-02"][ab / 24]);
+		hs[11] = b'0' + (ab % 24 / 10) as u8;
+		hs[12] = b'0' + (ab % 24 % 10) as u8;
+		let o = c.txt.add(h * OC);
+		let mut q = o;
+		for &id in &od {
+			let n = cnt[id] as u32 as usize;
 			if n == 0 {
 				continue;
 			}
-			let v = std::slice::from_raw_parts_mut(lp.add(x), n);
+			let v = &mut v[off[id] as usize - n..off[id] as usize];
 			let (r50, r95, r99) = ((50 * n + 99) / 100, (95 * n + 99) / 100, (99 * n + 99) / 100);
-			let ps = if n <= 24 {
+			let ps = if n <= 20 {
 				v.sort_unstable();
 				[v[r50 - 1], v[r95 - 1], v[r99 - 1]]
 			} else {
@@ -371,102 +319,64 @@ unsafe fn work(t: usize, c: &Cx) {
 				let p95 = *v[r50..].select_nth_unstable(r95 - 1 - r50).1;
 				[p50, p95, *v[r95..].select_nth_unstable(r99 - 1 - r95).1]
 			};
-			st[g] = ps;
-			let er = ge[g] as u64;
-			bytes += 28 + nm[r].len() + digits(n as u64) + ps.iter().map(|&p| digits(p as u64)).sum::<usize>() + digits(er) + digits(er * 1_000_000 / n as u64);
-		}
-		c.hl[h + 1].store(bytes, Relaxed);
-	}
-	c.bar.wait();
-	if t == 0 {
-		*c.lat.g() = Vec::new();
-		for h in 0..H {
-			c.hl[h + 1].fetch_add(c.hl[h].load(Relaxed), Relaxed);
-		}
-		*c.om.g() = omap(&c.file, c.hl[H].load(Relaxed));
-	}
-	c.bar.wait();
-	// format each hour straight into the output at its offset
-	let mut o = Vec::with_capacity(1 << 18);
-	loop {
-		let h = c.nx[1].fetch_add(1, Relaxed);
-		if h >= H {
-			break;
-		}
-		o.clear();
-		let ab = h + 18;
-		let mut hs = *b"2026-10-30T00:00:00Z ";
-		hs[..10].copy_from_slice([b"2026-10-30", b"2026-10-31", b"2026-11-01", b"2026-11-02"][ab / 24]);
-		hs[11] = b'0' + (ab % 24 / 10) as u8;
-		hs[12] = b'0' + (ab % 24 % 10) as u8;
-		for r in 0..e {
-			let g = h * e + r;
-			let n = (go[g + 1] - go[g]) as u64;
-			if n == 0 {
-				continue;
+			let e = cnt[id] >> 32;
+			for b in [&hs[..], nm(id)] {
+				std::ptr::copy_nonoverlapping(b.as_ptr(), q, b.len());
+				q = q.add(b.len());
 			}
-			let er = ge[g] as u64;
-			o.extend_from_slice(&hs);
-			o.extend_from_slice(nm[r]);
-			for v in [n, st[g][0] as u64, st[g][1] as u64, st[g][2] as u64, er, er * 1_000_000 / n] {
-				num(&mut o, v);
+			for x in [n as u32, ps[0], ps[1], ps[2], e as u32, (e * 1_000_000 / n as u64) as u32] {
+				q = num(q, x);
 			}
-			o.push(b'\n');
+			*q = b'\n';
+			q = q.add(1);
 		}
-		std::ptr::copy_nonoverlapping(o.as_ptr(), c.om.g().add(c.hl[h].load(Relaxed)), o.len());
-	}
-	c.bar.wait();
-	if t == 0 {
-		ofin(&c.file, *c.om.g(), c.hl[H].load(Relaxed));
+		// offsets are assigned in hour order: a formatted hour waits until the hours before it are placed, and whoever places it writes it
+		let mut w = vec![];
+		{
+			let mut g = c.out.lock().unwrap();
+			g.2[h] = q.offset_from(o) as usize;
+			while g.0 < H && g.2[g.0] != usize::MAX {
+				w.push((g.0, g.1, g.2[g.0]));
+				g.1 += g.2[g.0];
+				g.0 += 1;
+			}
+		}
+		for (k, at, n) in w {
+			let b = c.txt.add(k * OC);
+			c.file.write_all_at(std::slice::from_raw_parts(b, n), at as u64).unwrap();
+			free(b, n);
+		}
 	}
 }
 
 fn main() {
-	let (mut data, mut out) = ("/data".to_string(), "/out".to_string());
+	// M_ARENA_MAX = 1: no per-thread malloc arenas, whose mapping takes the address-space lock and stalls faulting threads
+	unsafe { mallopt(-8, 1) };
 	let a: Vec<String> = std::env::args().collect();
-	for i in 1..a.len() - 1 {
-		match a[i].as_str() {
-			"--data" => data = a[i + 1].clone(),
-			"--out" => out = a[i + 1].clone(),
-			_ => {}
-		}
-	}
-	let buf = load(data + "/requests.log");
-	let file = File::options().read(true).write(true).create(true).truncate(true).open(out + "/summary.txt").unwrap();
+	let arg = |k: &str, d: &str| a.iter().position(|x| x == k).map_or(d.to_string(), |i| a[i + 1].clone());
+	let inp = File::open(arg("--data", "/data") + "/requests.log").unwrap();
+	let len = inp.metadata().unwrap().len() as usize;
+	let file = File::create(arg("--out", "/out") + "/summary.txt").unwrap();
 	let nt = std::thread::available_parallelism().map_or(1, |n| n.get());
-	let mut b = vec![0; nt + 1];
-	b[nt] = buf.len();
-	for i in 1..nt {
-		let mut x = (buf.len() * i / nt).max(b[i - 1]);
-		while x > 0 && x < buf.len() && buf[x - 1] != b'\n' {
-			x += 1;
-		}
-		b[i] = x;
-	}
+	let cap = (2 * (len / 39 + nt) / (BLK - 1) + (H + 1) * nt + 1) / 2 * 2 * BLK; // records, at most 2 per line, plus partial blocks; whole pages
 	let c = Cx {
-		buf,
+		inp,
+		len,
 		file,
-		nt,
-		b,
-		locs: (0..nt).map(|_| s(Loc::default())).collect(),
 		bar: Barrier::new(nt),
 		tb: Tab {
-			slot: (0..TS).map(|_| Sl(AtomicU64::new(0), AtomicU64::new(0))).collect(),
+			slot: (0..TS).map(|_| AtomicU64::new(0)).collect(),
 			ent: unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(TS * 128, 64).unwrap()) as *mut Ent },
 			nid: AU::new(0),
 			gs: (0..NE).map(|_| AtomicU32::new(0)).collect(),
-			dup: AtomicBool::new(false),
 		},
-		ord: s(vec![]),
-		names: s(vec![]),
-		goff: s(vec![]),
-		gerr: s(vec![]),
-		st: s(vec![]),
-		lat: s(vec![]),
-		om: s(std::ptr::null_mut()),
-		tot: (0..nt).map(|_| AU::new(0)).collect(),
-		hl: (0..=H).map(|_| AU::new(0)).collect(),
+		rec: arena(H * cap * 4) as _,
+		val: arena(nt * cap * 4) as _,
+		txt: arena(H * OC),
+		cap,
+		top: (0..H).map(|_| AU::new(0)).collect(),
 		nx: [AU::new(0), AU::new(0)],
+		out: Mutex::new((0, 0, [usize::MAX; H])),
 	};
 	let c = &c;
 	std::thread::scope(|sc| {

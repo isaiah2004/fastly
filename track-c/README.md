@@ -4,9 +4,10 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, std only, one file (`src/main.rs`).
+Rust, std only, one file (`src/main.rs`), for Linux on x86-64 with AVX2, BMI2 and PCLMUL
+(`target-cpu=x86-64-v3` plus `+pclmulqdq` in `.cargo/config.toml`).
 
-- **Input.** `records.csv` is `mmap`ed (declared via `extern "C"`, Linux only; `std::fs::read` elsewhere).
+- **Input.** `records.csv` is `mmap`ed (declared via `extern "C"`).
   `regions.csv` is split into 64 pieces that the threads claim and parse in parallel into a dense
   `region_id -> country+1` byte table (0 = unmatched).
 - **Parallel CSV without a sequential pass.** By the 2.1 grammar `"` only occurs inside quoted fields, so a
@@ -17,7 +18,8 @@ Rust, std only, one file (`src/main.rs`).
   possible for other 2.1-legal files) makes the program discard everything and rerun a simple sequential
   parser, so the output is always exact.
 - **Parsing.** AVX2 compares per 64-byte block give quote/comma/LF bitmasks; a prefix-XOR of the quote
-  mask gives the inside-quotes mask, so commas and LFs outside quotes are the field/record boundaries.
+  mask (one carry-less multiply) gives the inside-quotes mask, so commas and LFs outside quotes are the
+  field/record boundaries. A small scanner hands out these positions block by block, five per record.
   Unescaped name/note lengths come from field length and quote counts (`""` counts 1, delimiters 0).
   `id`, `region_id` and `amount` are parsed with SWAR (8 digits at a time), amounts in integer cents.
   BOMs are skipped only at record starts; a final record without terminator is handled at EOF.
@@ -30,7 +32,8 @@ Rust, std only, one file (`src/main.rs`).
   messages ahead) with plain loads and stores. Each thread may have at most 4 batches per owner in
   flight; a thread that runs out applies waiting batches (taking the range's lock), so memory stays
   bounded and late or descheduled threads do not stall the rest. `names_distinct` is a popcount per
-  country. The region entry is prefetched and each record is aggregated 8 records after it is parsed.
+  country. Parsed records wait in a 128-record stage while their region entries are prefetched, then are
+  aggregated and sent.
 - **Memory.** ~12 MB peak anonymous memory locally: 8 MB name table (huge pages requested), 1 MB region
   table, message batches, the rest runtime. One glibc malloc arena (`mallopt`); 256 KiB thread stacks.
 - **Fallbacks.** More than ~114k distinct names, more than 255 countries, or an unexpected `regions.csv`

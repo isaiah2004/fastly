@@ -4,36 +4,35 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-Rust, standard library only. One persistent pool of `available_parallelism()` threads that sync on a `Barrier` between phases; the input is split into equal chunks at line starts.
+Rust, standard library only, Linux and AVX2 (`target-cpu=x86-64-v3`). One scoped pool of `available_parallelism()` threads that sync on a `Barrier` between phases.
 
-1. **Load.** `mmap` the log read-only. Each thread asks the kernel to populate the page tables for its own chunk (`MADV_POPULATE_READ`), so that work runs in parallel too.
-2. **Pass 1 (parse, intern, count).** Each thread walks a 64-byte bitmask of newline positions (AVX2), so lines don't wait on each other. For each line:
+1. **Single pass (read, parse, intern, record).** Threads take 64 KB chunks of the log from an atomic counter and `pread` each chunk (plus up to 512 bytes, to finish the last line) into a buffer that stays in L2. A chunk owns the lines that start in it. Newline positions go into a list first, two per 64 bytes and without branching, so the line loop is predictable. For each line:
    - The hour index (0..71) comes straight from the day and hour digits. All timestamps fall in one fixed 72-hour window, so there is no date parsing.
-   - The endpoint starts at the first `/` (SWAR) and ends 4 bytes before the last space, which an SSE compare finds.
-   - The endpoint is hashed from two masked 32-byte AVX2 blocks and interned in one lock-free open-addressing table that all threads share. The table stores the bytes zero-padded, so checking equality takes 2 vector compares. Each slot keeps the length, the id and the full 64-bit hash in one 16-byte record, so a probe touches one cache line. Ids are global, so no merge step is needed.
-   - The thread adds to a per-thread `count | errors<<32` counter for (hour, endpoint). Nothing is stored per line.
-3. **Offsets.** The ~1,842 endpoints are sorted once by bytes. Group order is hour-major and then endpoint rank, which is exactly the output order. A two-phase parallel prefix sum gives every group, and every thread inside a group, its slot range in one `u32` latency array. A bitmask of the hours each thread saw keeps this phase from touching unused counters.
-4. **Pass 2 (scatter).** The threads re-walk their chunks and find each endpoint again with a read-only probe of the now-frozen table that matches the full 64-bit hash and the length, with no byte compare (if pass 1 ever saw two different endpoints share both, pass 2 compares bytes too). They parse each latency with an SSE `maddubs`/`madd` routine that has no branches, then write it straight to its slot.
-5. **Percentiles.** Hours are handed out dynamically. Each group takes exact nearest-rank p50, p95 and p99 with `select_nth_unstable` in the order p50 on the whole group, p95 on the upper half, p99 on the top 5%. Small groups are sorted instead. The exact byte length of every hour's output is computed at the same time.
-6. **Output.** The output file is sized with `ftruncate` and `mmap`ed shared, and each thread formats its hours (2-digit LUT itoa) directly at their final offsets. There is no single serial `write` of 10 MB, and the only memory the output costs is its page cache.
+   - The endpoint starts at the first `/` (SWAR) and ends 4 bytes before the last space, which an SSE compare finds. The latency is parsed by an SSE `maddubs`/`madd` routine that has no branches.
+   - The endpoint is hashed from its first, middle and last 8 bytes and interned in one lock-free open-addressing table that all threads share. Each slot is one 8-byte word (32-bit hash tag, length, id). The bytes are kept zero-padded beside it and are always compared (one 64-byte AVX2 step for endpoints up to 64 bytes), so the result is exact. Ids are global, so no merge step is needed.
+   - The line becomes one `u32` record, `id<<21 | error<<20 | latency`, appended to the thread's current block for that hour. A latency of 2^20-1 or more is written as an escape value followed by the full latency in a second record (about 1% of lines). Each hour has its own region of a reserved (`MAP_NORESERVE`), small-page arena, and threads take 512-record blocks from it with an atomic counter.
+2. **Per hour (dynamic).** After a barrier, each thread sorts the ~1,842 endpoint ids by bytes for itself (no second barrier). Then each worker takes the next hour:
+   - It walks the hour's region twice (count per endpoint, then scatter the latencies by endpoint rank into a per-thread array of about 170 KB that stays in L2), then releases the region with `MADV_DONTNEED`.
+   - It takes exact nearest-rank p50, p95 and p99 per group with `select_nth_unstable`: p50 on the whole group, p95 on the part above it, p99 on the part above that. Groups of 20 or fewer are sorted instead.
+   - It formats the hour's lines (branch-free 2-digit LUT itoa) into the hour's slot of a reserved output area.
+   - Offsets are assigned in hour order under a mutex. Whoever completes the next run of hours `pwrite`s them at their offsets and releases their pages, so threads write in parallel and the 10 MB output is never held in one buffer.
 
-Memory stays low on purpose. Nothing per line is kept between passes. The latency array (12.4 MB) is the only large allocation, and it is freed before the output is written.
+`mallopt(M_ARENA_MAX, 1)` keeps glibc from mapping per-thread arenas, which would take the address-space lock while other threads fault pages in.
 
-On non-Linux targets (local testing on Windows), the loader falls back to `std::fs::read` and a buffered write, and the code falls back to scalar versions of the SIMD helpers.
+Memory: the records take 4 bytes per line (12.5 MB for `full`), which is the peak. Everything else is a few MB of per-thread buffers. The input is never mapped.
 
 ## Dependencies
 
-None (std only; `mmap`/`madvise` are declared via `extern "C"`).
+None (std only; `mmap`, `madvise` and `mallopt` are declared via `extern "C"`).
 
 ## Build and run
 
-    cargo build --release          # .cargo/config.toml sets target-cpu=x86-64-v3 (AVX2/BMI2)
+    cargo build --release          # Linux; .cargo/config.toml sets target-cpu=x86-64-v3 (AVX2/BMI2)
     ./target/release/solution --data /data --out /out
 
 Defaults are `/data/requests.log` and `/out/summary.txt`.
 
 ## With another 24 hours
 
-- Do it in one pass: keep `(id, latency)` per line, so the 240 MB input is never re-read. That costs about 12 MB more memory.
-- Make the intern table one cache line per lookup, with the tag and the first 56 bytes inline.
-- Use a radix-based selection for the few very large groups.
+- Hide the intern table's L2 latency at full thread count (prefetching helped one thread but not twelve).
+- A cheaper selection for the many groups of 20 to 200 lines.
