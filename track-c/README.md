@@ -21,16 +21,18 @@ Rust, std only, one file (`src/main.rs`).
   Unescaped name/note lengths come from field length and quote counts (`""` counts 1, delimiters 0).
   `id`, `region_id` and `amount` are parsed with SWAR (8 digits at a time), amounts in integer cents.
   BOMs are skipped only at record starts; a final record without terminator is handled at EOF.
-- **Distinct names.** A lock-free hash table shared by all threads: one 32-byte entry per distinct name
-  holding a hash tag, the length and the raw name bytes inline (exact byte comparison, never hash-only;
-  names over 24 bytes are compared against the file). Raw inner bytes of a quoted field map 1:1 to
-  unescaped values, and the empty unquoted and `""` names share one key. A parallel table holds a 256-bit
-  country set per name. Each slot range is owned by one thread; other threads send `(slot, country)` pairs
-  to the owner in batches, so bits are set with plain stores. `names_distinct` is a popcount per country.
-  Name hashing, the table line and the region entry are software-prefetched and each record is
-  aggregated 8 records after it is parsed.
-- **Memory.** ~12.5 MB peak anonymous memory: 4 MB name slots + 4 MB country bitmaps (huge pages
-  requested), 1 MB region table, the rest runtime. One glibc malloc arena (`mallopt`).
+- **Distinct names.** One 64-byte line per distinct name: a hash tag, the length, the raw name bytes
+  inline (exact byte comparison, never hash-only; names over 24 bytes are compared against the file) and
+  a 256-bit country set. Raw inner bytes of a quoted field map 1:1 to unescaped values, and the empty
+  unquoted and `""` names share one key. The table is split into one slot range per thread, chosen by
+  the name's hash, and only the range's owner touches it: parsers send each record's (name, country) as
+  a 32-byte message in batches over lock-free stacks, and the owner probes its range (prefetching a few
+  messages ahead) with plain loads and stores. Each thread may have at most 4 batches per owner in
+  flight; a thread that runs out applies waiting batches (taking the range's lock), so memory stays
+  bounded and late or descheduled threads do not stall the rest. `names_distinct` is a popcount per
+  country. The region entry is prefetched and each record is aggregated 8 records after it is parsed.
+- **Memory.** ~12 MB peak anonymous memory locally: 8 MB name table (huge pages requested), 1 MB region
+  table, message batches, the rest runtime. One glibc malloc arena (`mallopt`); 256 KiB thread stacks.
 - **Fallbacks.** More than ~114k distinct names, more than 255 countries, or an unexpected `regions.csv`
   shape also fall back to the exact sequential path. `--slow` forces it (used for cross-checking).
 
