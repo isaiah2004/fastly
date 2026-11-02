@@ -58,15 +58,20 @@ fn uint_sat(s: &[u8]) -> u64 {
     let t = s.iter().position(|&b| b != b'0').unwrap_or(s.len());
     (s.len() - t <= 18).then(|| uint(&s[t..])).unwrap_or(u64::MAX)
 }
-/// Decimal digits in d[s..e]: SWAR for up to 8 digits, saturating loop otherwise.
+/// Decimal digits in d[s..e]: SWAR for up to 8 digits, saturating loop otherwise. e >= 8: the fast
+/// path only runs when the header's LF is at >= 8, and every field ends after it.
 #[inline(always)]
 fn num(d: &[u8], s: usize, e: usize) -> u64 {
     let n = e.wrapping_sub(s);
-    if n > 8 || e < 8 {
+    if n > 8 {
         return uint_sat(d.get(s..e).unwrap_or(&[]));
     }
-    let m = HIGH[n];
-    let mut x = (rd8(d, e - 8) & m).wrapping_sub(0x3030303030303030 & m);
+    swar(rd8(d, e - 8), HIGH[n])
+}
+/// The value of the ASCII digits in the bytes of w that mask m keeps (the top bytes of the word).
+#[inline(always)]
+fn swar(w: u64, m: u64) -> u64 {
+    let mut x = (w & m).wrapping_sub(0x3030303030303030 & m);
     x = (x.wrapping_mul(10) + (x >> 8)) & 0x00FF00FF00FF00FF;
     x = (x.wrapping_mul(100) + (x >> 16)) & 0x0000FFFF0000FFFF;
     (x.wrapping_mul(10000) + (x >> 32)) & 0xFFFFFFFF
@@ -426,10 +431,12 @@ fn record(cx: &Ctx, st: &mut St, sg: &mut Stage, rs: usize, f: &[usize; 5], q: u
     let (end, s) = (f[4], f[3] + 1);
     let e = end - (at(d, end - 1) == 13) as usize;
     let neg = s < e && at(d, s) == b'-';
-    let c = if e >= s + 4 + neg as usize && at(d, e - 3) == b'.' {
-        let x = at(d, e - 2).wrapping_sub(b'0') as u64;
-        let y = at(d, e - 1).wrapping_sub(b'0') as u64;
-        (num(d, s + neg as usize, e - 3) * 100 + x * 10 + y) as i64 * if neg { -1 } else { 1 }
+    let k = e.wrapping_sub(s + neg as usize);
+    let c = if k.wrapping_sub(4) <= 4 && at(d, e - 3) == b'.' {
+        // "D{1,5}.DD" in the 8 bytes ending at e: drop the '.' by moving the integer digits up a byte
+        let w = rd8(d, e - 8);
+        let v = (w << 8 & 0x0000_FFFF_FFFF_FF00) | (w & 0xFFFF_0000_0000_0000);
+        swar(v, HIGH[k - 1]) as i64 * if neg { -1 } else { 1 }
     } else {
         cents(d.get(s..e).unwrap_or(&[]))
     };
@@ -562,6 +569,9 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
     // per chunk: quotes in chunk << 2 | checked << 1 | implied parity
     let res: Vec<AtomicU64> = (0..nch).map(|_| AtomicU64::new(0)).collect();
     let hdr = d.iter().position(|&b| b == b'\n').map_or(len, |x| x + 1);
+    if hdr < 9 {
+        return None; // num() reads the 8 bytes before a field's end
+    }
     const RP: usize = 64;
     let z = || AtomicUsize::new(0);
     let (next, done, rnext, rdone, low) = (z(), z(), z(), z(), z());
