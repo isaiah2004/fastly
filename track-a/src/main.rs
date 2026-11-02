@@ -240,8 +240,25 @@ const LUT: [u8; 200] = {
 	}
 	t
 };
-// write " <v>" at q (and up to 15 bytes of scratch after it); returns the end. No branches.
-unsafe fn num(q: *mut u8, mut v: u32) -> *mut u8 {
+// write " <v>" at q (and up to 8 bytes of scratch after it); returns the end. SWAR: 8 digits in one u64.
+#[inline(always)]
+unsafe fn num(q: *mut u8, v: u32) -> *mut u8 {
+	if v >= 100_000_000 {
+		return numb(q, v);
+	}
+	let x = (v / 10000) as u64 | ((v % 10000) as u64) << 32;
+	let y = (x * 10486 >> 20) & 0x7f_0000_007f;
+	let x = y | (x - y * 100) << 16;
+	let y = (x * 103 >> 10) & 0x000f_000f_000f_000f;
+	let x = y | (x - y * 10) << 8;
+	let s = (x | 1 << 56).trailing_zeros() & !7;
+	*q = b' ';
+	(q.add(1) as *mut u64).write_unaligned((x | 0x3030303030303030) >> s);
+	q.add(9 - (s / 8) as usize)
+}
+#[cold]
+#[inline(never)]
+unsafe fn numb(q: *mut u8, mut v: u32) -> *mut u8 {
 	let (n, mut t) = (v.max(1).ilog10() as usize + 1, [0u8; 32]);
 	for i in 0..5 {
 		std::ptr::copy_nonoverlapping(LUT.as_ptr().add(v as usize % 100 * 2), t.as_mut_ptr().add(14 - 2 * i), 2);
@@ -318,7 +335,9 @@ unsafe fn work(t: usize, c: &Cx) {
 		&(&(*tb.ent.add(g)).0)[..(tb.slot[s].load(Relaxed) >> 16 & 255) as usize]
 	};
 	let mut od: Vec<usize> = (0..tb.nid.load(Relaxed)).collect();
-	od.sort_unstable_by(|&p, &q| nm(p).cmp(nm(q)));
+	// names are zero-padded in their entry and hold no NUL: the first 8 bytes big-endian order like the names
+	let key: Vec<u64> = (0..NE).map(|g| u64::from_be_bytes((&(*tb.ent.add(g)).0)[..8].try_into().unwrap())).collect();
+	od.sort_unstable_by(|&p, &q| key.get_unchecked(p).cmp(key.get_unchecked(q)).then_with(|| nm(p).cmp(nm(q))));
 	// per hour: count, scatter by endpoint rank, release the records, exact nearest-rank percentiles, format, write
 	// hours in index order, but the biggest first within each run of 12 (load swings 5x over a day): a shorter tail
 	let mut ord: Vec<usize> = (0..H).collect();
@@ -338,8 +357,8 @@ unsafe fn work(t: usize, c: &Cx) {
 		});
 		let mut tot = 0;
 		for &id in &od {
-			off[id] = tot;
-			tot += cnt[id] as u32;
+			*off.get_unchecked_mut(id) = tot;
+			tot += *cnt.get_unchecked(id) as u32;
 		}
 		let v = std::slice::from_raw_parts_mut(c.val.add(t * c.cap), c.cap);
 		off[NE - 1] = tot; // block tails land after the groups
@@ -362,11 +381,12 @@ unsafe fn work(t: usize, c: &Cx) {
 		let o = c.txt.add(h * OC);
 		let mut q = o;
 		for &id in &od {
-			let (n, e) = (cnt[id] as u32 as usize, (cnt[id] >> 32) as u32);
+			let ci = *cnt.get_unchecked(id);
+			let (n, e) = (ci as u32 as usize, (ci >> 32) as u32);
 			if n == 0 {
 				continue;
 			}
-			let v = &mut v[off[id] as usize - n..off[id] as usize];
+			let v = v.get_unchecked_mut(*off.get_unchecked(id) as usize - n..*off.get_unchecked(id) as usize);
 			let r = |p: usize| (p * n + 99) / 100;
 			let (r50, r95, r99) = (r(50), r(95), r(99));
 			let ks = [r50 - 1, r95 - 1, r99 - 1];
