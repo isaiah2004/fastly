@@ -29,6 +29,19 @@ struct Tab {
 
 // endpoint id: probe from the hash, insert if new
 #[inline(always)]
+// hit path with the table pointers already in registers; anything else goes to find
+#[inline(always)]
+unsafe fn find_fast(tb: &Tab, slot: *const AtomicU64, ent: *const Ent, e: *const u8, n: usize, hv: u64) -> usize {
+	let t = (*slot.add(hv as usize & (TS - 1))).load(Acquire);
+	if t >> 16 == (hv << 16 | n as u64) && v::eq(e, n, (*ent.add((t & 0xffff) as usize - 1)).0.as_ptr()) {
+		return (t & 0xffff) as usize - 1;
+	}
+	find_slow(tb, e, n, hv)
+}
+#[cold]
+#[inline(never)]
+unsafe fn find_slow(tb: &Tab, e: *const u8, n: usize, hv: u64) -> usize { find(tb, e, n, hv) }
+
 unsafe fn find(tb: &Tab, e: *const u8, n: usize, hv: u64) -> usize {
 	let tag = hv << 32 | (n as u64) << 16;
 	let mut s = hv as usize & (TS - 1);
@@ -122,8 +135,8 @@ mod v {
 #[inline(always)]
 unsafe fn hash(p: *const u8, n: usize) -> u64 {
 	use std::arch::x86_64::_mm_crc32_u64 as crc;
-	let (m, o) = (!0u64 >> (64 - 8 * n.min(8)), n.max(8) - 8);
-	let r = |o: usize| (p.add(o) as *const u64).read_unaligned() & m;
+	let (k, o) = ((8 * n as u64).min(64), n.max(8) - 8);
+	let r = |o: usize| std::arch::x86_64::_bzhi_u64((p.add(o) as *const u64).read_unaligned(), k as u32);
 	crc(crc(crc(n as u64, r(0)), r(o / 2)), r(o))
 }
 
@@ -157,6 +170,16 @@ unsafe fn lines(d: *const u8, mut s: usize, end: usize, mut f: impl FnMut(usize,
 	}
 }
 
+#[cold]
+#[inline(never)]
+unsafe fn esc(cx: &Cx, h: usize, id: u32, lat: u32) {
+	*cx.big.add(h * cx.cap + cx.bt.get_unchecked(h).fetch_add(1, Relaxed)) = (id as u64) << 32 | lat as u64;
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn nb_(h: usize, c: (u32, u32), cx: &Cx) -> (u32, u32) { nb(h, c, cx) }
+
 // a new block for hour h
 #[cold]
 unsafe fn nb(h: usize, c: (u32, u32), cx: &Cx) -> (u32, u32) {
@@ -172,29 +195,35 @@ unsafe fn nb(h: usize, c: (u32, u32), cx: &Cx) -> (u32, u32) {
 // the single pass: intern the endpoint, append the line's record to its hour
 unsafe fn pass(d: *const u8, p: usize, end: usize, l: &mut Loc, cx: &Cx) {
 	let (r, tb, mut hk, mut h) = (cx.rec, &cx.tb, 0, 0);
+	let (slot, ent) = (tb.slot.as_ptr(), tb.ent as *const Ent);
+	let ld = |h: usize, l: &Loc| { let c = *l.get_unchecked(h); (r.add(c.0 as usize), r.add(c.1 as usize)) };
+	let st = |p: (*mut u32, *mut u32)| (p.0.offset_from(r) as u32, p.1.offset_from(r) as u32);
+	let mut c = ld(0, l);
 	lines(d, p, end, |p, nl| {
 		// the hour of the line before, unless the month, day or hour bytes differ
 		let k = (d.add(p + 5) as *const u64).read_unaligned();
 		if k != hk {
+			*l.get_unchecked_mut(h) = st(c);
 			(hk, h) = (k, hour(d.add(p)));
+			c = ld(h, l);
 		}
 		let es = ep_start(d, p);
 		let ls = v::lastsp(d.add(nl - 16));
 		let sp = nl - 16 + ls; // the space before the latency
 		let n = sp - 4 - es;
-		let id = find(tb, d.add(es), n, hash(d.add(es), n)) as u32;
+		let id = find_fast(tb, slot, ent, d.add(es), n, hash(d.add(es), n)) as u32;
 		let lat = v::lat(d.add(nl - 16), 15 - ls);
-		let mut c = *l.get_unchecked(h);
 		if c.0 >= c.1 {
-			c = nb(h, c, cx);
+			let n = nb_(h, st(c), cx);
+			c = (r.add(n.0 as usize), r.add(n.1 as usize));
 		}
-		*r.add(c.0 as usize) = id << 21 | ((*d.add(sp - 3) == b'5') as u32) << 20 | lat.min(ESC);
+		*c.0 = id << 21 | ((*d.add(sp - 3) == b'5') as u32) << 20 | lat.min(ESC);
 		if lat >= ESC {
-			*cx.big.add(h * cx.cap + cx.bt[h].fetch_add(1, Relaxed)) = (id as u64) << 32 | lat as u64;
+			esc(cx, h, id, lat);
 		}
-		c.0 += 1;
-		*l.get_unchecked_mut(h) = c;
-	})
+		c.0 = c.0.add(1);
+	});
+	*l.get_unchecked_mut(h) = st(c);
 }
 
 // f(record) for every record of hour h (block tails are FILL records)
