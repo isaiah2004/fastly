@@ -144,20 +144,20 @@ static MK: [[u8; 32]; 2] = [[0xFF; 32], [0; 32]]; // MK[32 - len..][..32]: len b
                                                   // Token bytes [s, s+len) lowercased and zero padded to 32 bytes (len <= 32).
 #[inline(always)]
 fn load_key(buf: &[u8], s: usize, len: usize) -> Key {
+    // buf has 64 readable bytes after its end (see load)
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if s + 32 <= buf.len() {
-        unsafe {
-            use std::arch::x86_64::*;
-            let v = _mm256_or_si256(
-                _mm256_loadu_si256(buf.as_ptr().add(s) as *const __m256i),
-                _mm256_set1_epi8(0x20),
-            );
-            return std::mem::transmute(_mm256_and_si256(
-                v,
-                _mm256_loadu_si256((MK.as_ptr() as *const u8).add(32 - len) as *const __m256i),
-            ));
-        }
-    }
+    return unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm256_or_si256(
+            _mm256_loadu_si256(buf.as_ptr().add(s) as *const __m256i),
+            _mm256_set1_epi8(0x20),
+        );
+        std::mem::transmute(_mm256_and_si256(
+            v,
+            _mm256_loadu_si256((MK.as_ptr() as *const u8).add(32 - len) as *const __m256i),
+        ))
+    };
+    #[allow(unreachable_code)]
     let mut b = [0u8; 32];
     let n = (buf.len() - s).min(32);
     b[..n].copy_from_slice(&buf[s..s + n]);
@@ -171,23 +171,22 @@ fn load_key(buf: &[u8], s: usize, len: usize) -> Key {
 #[inline(always)]
 fn load12(buf: &[u8], s: usize, len: usize) -> (u64, u32) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if s + 16 <= buf.len() {
-        unsafe {
-            use std::arch::x86_64::*;
-            let v = _mm_or_si128(
-                _mm_loadu_si128(buf.as_ptr().add(s) as *const __m128i),
-                _mm_set1_epi8(0x20),
-            );
-            let v = _mm_and_si128(
-                v,
-                _mm_loadu_si128((MK.as_ptr() as *const u8).add(32 - len) as *const __m128i),
-            );
-            return (
-                _mm_cvtsi128_si64(v) as u64,
-                _mm_extract_epi32::<2>(v) as u32,
-            );
-        }
-    }
+    return unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm_or_si128(
+            _mm_loadu_si128(buf.as_ptr().add(s) as *const __m128i),
+            _mm_set1_epi8(0x20),
+        );
+        let v = _mm_and_si128(
+            v,
+            _mm_loadu_si128((MK.as_ptr() as *const u8).add(32 - len) as *const __m128i),
+        );
+        (
+            _mm_cvtsi128_si64(v) as u64,
+            _mm_extract_epi32::<2>(v) as u32,
+        )
+    };
+    #[allow(unreachable_code)]
     let k = load_key(buf, s, len);
     (k[0], k[1] as u32)
 }
@@ -276,6 +275,7 @@ fn line_tokens(buf: &[u8], p: usize, pos: &mut Vec<u32>) -> usize {
     }
 }
 
+// The file's bytes, followed by at least 64 readable zero bytes (key loads may read past the end).
 fn load(path: &str) -> &'static [u8] {
     #[cfg(target_os = "linux")]
     {
@@ -285,14 +285,19 @@ fn load(path: &str) -> &'static [u8] {
         use std::os::unix::io::AsRawFd;
         let f = std::fs::File::open(path).unwrap();
         let len = f.metadata().unwrap().len() as usize;
-        if len > 0 {
-            let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, f.as_raw_fd(), 0) };
-            if p as isize != -1 {
+        // anonymous zero pages, then the file mapped over their start
+        let a = unsafe { mmap(std::ptr::null_mut(), len + 64, 1, 0x22, -1, 0) };
+        if len > 0 && a as isize != -1 {
+            let p = unsafe { mmap(a, len, 1, 0x12, f.as_raw_fd(), 0) };
+            if p == a {
                 return unsafe { std::slice::from_raw_parts(p, len) };
             }
         }
     }
-    Box::leak(std::fs::read(path).unwrap().into_boxed_slice())
+    let mut v = std::fs::read(path).unwrap();
+    v.resize(v.len() + 64, 0);
+    let n = v.len() - 64;
+    &Box::leak(v.into_boxed_slice())[..n]
 }
 
 // vec![v; n] whose big buffers ask for huge pages (fewer TLB misses on random access).
@@ -467,9 +472,8 @@ impl W {
         }
         let (mut sl, mut kl) = (l0 + c.ew + 4, 0);
         for (pos, &(k0, k1, h)) in self.ks.iter().enumerate() {
-            if let Some(x) = self.ks.get(pos + PD) {
-                c.tab.prefetch32(x.2);
-            }
+            c.tab
+                .prefetch32(unsafe { (*self.ks.as_ptr().add(pos + PD)).2 });
             let r = if k1 == u32::MAX {
                 k0 as u32
             } else {
@@ -535,7 +539,7 @@ fn worker(c: &Ctx, bounds: &[usize]) -> Vec<WOut> {
                 let pos = &w.pos;
                 doc = parse_u32(&buf[p + pos[0] as usize..p + pos[1] as usize]);
                 w.ks.clear();
-                w.ks.reserve(np);
+                w.ks.reserve(np + PD);
                 let ks = w.ks.as_mut_ptr();
                 for j in 1..np {
                     let (s, e) = unsafe {
@@ -561,7 +565,12 @@ fn worker(c: &Ctx, bounds: &[usize]) -> Vec<WOut> {
                     };
                     unsafe { ks.add(j - 1).write(ent) };
                 }
-                unsafe { w.ks.set_len(np - 1) };
+                unsafe {
+                    for j in 0..PD {
+                        ks.add(np - 1 + j).write((0, 0, 0)); // prefetch padding
+                    }
+                    w.ks.set_len(np - 1);
+                }
                 w.doc(c, doc);
             }
             p += len;
