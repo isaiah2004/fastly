@@ -19,13 +19,18 @@ struct Tab {
     sh: u32,
     keys: Vec<Key>,
 }
+// Hash of a term of at most 12 bytes from its first 8 bytes and the next 4 (same as hk), top 32 bits.
+#[inline(always)]
+fn h12(k0: u64, k1: u32) -> u32 {
+    ((k0 ^ (k1 as u64).rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u32
+}
 #[inline(always)]
 fn k1(k: &Key) -> u32 {
     k[1] as u32 | ((k[1] >> 32 != 0) as u32) << 31
 }
 impl Tab {
     fn new(bits: u32) -> Tab {
-        Tab { slots: vec![(0, 0, 0); 1 << bits], sh: 64 - bits, keys: Vec::new() }
+        Tab { slots: hvec(1 << bits, (0, 0, 0)), sh: 64 - bits, keys: Vec::new() }
     }
     fn of(keys: Vec<Key>) -> Tab {
         let mut t = Tab::new((keys.len() * 4 + 4).next_power_of_two().trailing_zeros().max(4));
@@ -57,11 +62,27 @@ impl Tab {
         self.get_h(k, hk(k))
     }
     #[inline(always)]
-    fn prefetch(&self, h: u64) {
+    fn prefetch32(&self, h: u32) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::*;
-            _mm_prefetch(self.slots.as_ptr().add((h >> self.sh) as usize) as *const i8, _MM_HINT_T0)
+            _mm_prefetch(self.slots.as_ptr().add((h >> (self.sh - 32)) as usize) as *const i8, _MM_HINT_T0)
+        }
+    }
+    // Lookup of a term of at most 12 bytes (k0, k1 as in the slots) with h = h12(k0, k1).
+    #[inline(always)]
+    fn get12(&self, k0: u64, k1: u32, h: u32) -> u32 {
+        let m = self.slots.len() - 1;
+        let mut i = (h >> (self.sh - 32)) as usize;
+        loop {
+            let s = unsafe { *self.slots.get_unchecked(i) };
+            if s.0 == k0 && s.1 == k1 {
+                return s.2;
+            }
+            if s.0 == 0 {
+                return MISS;
+            }
+            i = (i + 1) & m;
         }
     }
     #[inline(always)]
@@ -119,6 +140,22 @@ fn load_key(buf: &[u8], s: usize, len: usize) -> Key {
         b[i] = (b[i] | 0x20) & MK[32 - len + i];
     }
     unsafe { std::mem::transmute(b) }
+}
+
+// Token bytes [s, s+len) lowercased, len <= 12: (bytes 0..8, bytes 8..12) zero padded.
+#[inline(always)]
+fn load12(buf: &[u8], s: usize, len: usize) -> (u64, u32) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if s + 16 <= buf.len() {
+        unsafe {
+            use std::arch::x86_64::*;
+            let v = _mm_or_si128(_mm_loadu_si128(buf.as_ptr().add(s) as *const __m128i), _mm_set1_epi8(0x20));
+            let v = _mm_and_si128(v, _mm_loadu_si128(MK.as_ptr().add(32 - len) as *const __m128i));
+            return (_mm_cvtsi128_si64(v) as u64, _mm_extract_epi32::<2>(v) as u32);
+        }
+    }
+    let k = load_key(buf, s, len);
+    (k[0], k[1] as u32)
 }
 
 // Bit i of the first mask: p[i] is [A-Za-z0-9]; of the second: p[i] is a newline.
@@ -205,6 +242,24 @@ fn load(path: &str) -> &'static [u8] {
     Box::leak(std::fs::read(path).unwrap().into_boxed_slice())
 }
 
+// vec![v; n] whose big buffers ask for huge pages (fewer TLB misses on random access).
+fn hvec<T: Clone>(n: usize, v: T) -> Vec<T> {
+    let mut x = Vec::with_capacity(n);
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn madvise(a: *mut u8, l: usize, adv: i32) -> i32;
+        }
+        let (a, e) = (x.as_ptr() as usize, x.as_ptr() as usize + n * std::mem::size_of::<T>());
+        let (a, e) = ((a + (1 << 21) - 1) & !((1 << 21) - 1), e & !((1 << 21) - 1));
+        if e > a {
+            unsafe { madvise(a as *mut u8, e - a, if std::env::var("NOHP").is_ok() { 15 } else { 14 }) };
+        }
+    }
+    x.resize(n, v);
+    x
+}
+
 // First line start at or after p.
 fn line_start(buf: &[u8], mut p: usize) -> usize {
     while p < buf.len() && p > 0 && buf[p - 1] != b'\n' {
@@ -232,10 +287,12 @@ struct Ctx<'a> {
 struct Ptr<T>(*mut T);
 unsafe impl<T> Sync for Ptr<T> {}
 
+// One sub-chunk (at most 32768 docs, one 65536-doc partition): postings of the list terms as
+// the low 16 bits of the doc ids, term t at post[offs[t]..offs[t + 1]]; phrase matches.
 struct WOut {
     part: u32,
-    stream: Vec<u8>,
-    counts: Vec<u32>,
+    offs: Vec<u32>,
+    post: Vec<u16>,
     pm: Vec<(u32, u32)>,
 }
 
@@ -284,7 +341,7 @@ fn decode(st: &[u8], mut f: impl FnMut(u16, usize)) {
 
 #[derive(Default)]
 struct W {
-    lc: Vec<u16>, // per term: last doc seen (relative to base; chunks hold at most 32768 docs)
+    lc: Vec<[u16; 2]>, // per term: last doc seen (relative to base; chunks hold at most 32768 docs), docs
     base: u32,
     lastpm: Vec<u32>,
     stream: Vec<u8>, // per doc with list terms: 0, doc (4 bytes LE), then LEB128(term + 1) each
@@ -293,7 +350,7 @@ struct W {
     kp: Vec<u32>,
     bms: Vec<u32>,
     lst: Vec<u32>,
-    ks: Vec<(Key, u64)>,
+    ks: Vec<(u64, u32, u32)>, // per token: (bytes 0..8, bytes 8..12, h12), or (term lookup result, MAX, 0) when longer
 }
 
 impl W {
@@ -304,14 +361,14 @@ impl W {
             v.clear();
             v.reserve(n);
         }
-        for &(_, h) in &self.ks {
-            c.tab.prefetch(h);
+        for &(_, _, h) in &self.ks {
+            c.tab.prefetch32(h);
         }
         // Look up every token and sort the hits by kind with branch-free appends (a miss is the
         // dummy term nt, which has no flags).
         let (mut nb, mut nl, mut kl) = (0, 0, 0);
-        for (pos, &(ref k, h)) in self.ks.iter().enumerate() {
-            let r = c.tab.get_h(k, h);
+        for (pos, &(k0, k1, h)) in self.ks.iter().enumerate() {
+            let r = if k1 == u32::MAX { k0 as u32 } else { c.tab.get12(k0, k1, h) };
             let r = if r == MISS { c.dummy } else { r };
             let ti = r & 0xFF_FFFF;
             let fl = r >> 24; // 1 list, 2 bitmap (bitmap index = id), 4 phrase key
@@ -348,8 +405,9 @@ impl W {
             for &t in &self.lst {
                 unsafe {
                     let e = self.lc.get_unchecked_mut(t as usize);
-                    let new = (*e != rel) as u32;
-                    *e = rel;
+                    let new = (e[0] != rel) as u32;
+                    e[0] = rel;
+                    e[1] += new as u16;
                     let v = t + 1;
                     let (m1, m2) = ((v >= 1 << 7) as u32, (v >= 1 << 14) as u32);
                     (st.add(sl) as *mut u32).write_unaligned((v & 0x7F | m1 << 7) | ((v >> 7) & 0x7F | m2 << 7) << 8 | (v >> 14) << 16);
@@ -367,7 +425,7 @@ impl W {
 fn worker(c: &Ctx, a: usize, b: usize, cuts: &[usize]) -> Vec<WOut> {
     let nt = c.tab.keys.len();
     let buf = c.buf;
-    let mut w = W { lc: vec![0; nt + 1], lastpm: vec![MISS; c.p_off.len() - 1], ..Default::default() };
+    let mut w = W { lc: hvec(nt + 1, [0, 0]), lastpm: vec![MISS; c.p_off.len() - 1], ..Default::default() };
     let mut outs = Vec::new();
     let mut bounds: Vec<usize> = cuts.iter().copied().filter(|&x| x > a && x < b).collect();
     bounds.insert(0, a);
@@ -375,7 +433,7 @@ fn worker(c: &Ctx, a: usize, b: usize, cuts: &[usize]) -> Vec<WOut> {
     for r in bounds.windows(2) {
         let (a, b) = (r[0], r[1]);
         let mut doc = MISS;
-        w.lc.fill(u16::MAX);
+        w.lc.fill([u16::MAX, 0]);
         w.base = parse_u32(&buf[a..a + buf[a..].iter().position(|&c| c == b'\t').unwrap()]);
         w.ks.reserve(1 << 12);
         scan(buf, a, b, |s, e, first| {
@@ -385,18 +443,39 @@ fn worker(c: &Ctx, a: usize, b: usize, cuts: &[usize]) -> Vec<WOut> {
                 }
                 doc = parse_u32(&buf[s..e]);
             } else {
-                let k = if e - s <= 32 { load_key(buf, s, e - s) } else { [0; 4] };
+                let len = e - s;
+                let ent = if len <= 12 {
+                    let (k0, k1) = load12(buf, s, len);
+                    (k0, k1, h12(k0, k1))
+                } else {
+                    (if len <= 32 { c.tab.get(&load_key(buf, s, len)) } else { MISS } as u64, u32::MAX, 0)
+                };
                 if w.ks.len() == w.ks.capacity() {
                     w.ks.reserve(w.ks.len());
                 }
-                unsafe { w.ks.as_mut_ptr().add(w.ks.len()).write((k, hk(&k))) };
+                unsafe { w.ks.as_mut_ptr().add(w.ks.len()).write(ent) };
                 unsafe { w.ks.set_len(w.ks.len() + 1) };
             }
         });
         if doc != MISS {
             w.doc(c, doc);
         }
-        outs.push(WOut { stream: std::mem::take(&mut w.stream), counts: Vec::new(), pm: std::mem::take(&mut w.pm), part: doc >> 16 });
+        // local counting sort of the stream (small enough to stay in cache)
+        let mut offs = Vec::with_capacity(nt + 1);
+        offs.push(0);
+        let mut acc = 0;
+        for e in &w.lc[..nt] {
+            offs.push(acc); // offs[t + 1] is the write cursor of t, then its end
+            acc += e[1] as u32;
+        }
+        let mut post = vec![0u16; acc as usize];
+        decode(&w.stream, |d, t| unsafe {
+            let o = offs.get_unchecked_mut(t + 1);
+            *post.get_unchecked_mut(*o as usize) = d;
+            *o += 1;
+        });
+        w.stream.clear();
+        outs.push(WOut { offs, post, pm: std::mem::take(&mut w.pm), part: doc >> 16 });
     }
     outs
 }
@@ -758,7 +837,7 @@ fn main() {
         kcnt[t] += 1;
     }
     tab.set_flags(&flags);
-    let mut bmv = vec![0u64; (nbm + 1) * w];
+    let mut bmv = hvec((nbm + 1) * w, 0u64);
     let ctx = Ctx { dummy: nt as u32, buf, tab, bm: Ptr(bmv.as_mut_ptr()), w, kl_off, kl, p_off, p_terms };
 
     // ---- parallel index pass
@@ -773,7 +852,6 @@ fn main() {
     }
     cuts.push(buf.len());
     // line starts of docs 32768, 65536, ... (binary search: ids ascend with the offset)
-    let nparts = (n_docs + 65535) >> 16;
     let pcuts: Vec<usize> = (1..(n_docs + 32767) >> 15)
         .map(|k| {
             let (mut lo, mut hi) = (0, buf.len());
@@ -799,66 +877,13 @@ fn main() {
     });
 
     lap("indexed");
-    // ---- postings for list terms: per term, per 65536-doc partition, the low 16 bits of the doc ids
-    let mut outs = outs;
-    std::thread::scope(|sc| {
-        for o in outs.iter_mut() {
-            sc.spawn(move || {
-                o.counts = vec![0; nt];
-                decode(&o.stream, |_, t| o.counts[t] += 1);
-            });
-        }
-    });
-    let mut off = vec![0u32; nt + 1];
-    for t in 0..nt {
-        off[t + 1] = off[t] + outs.iter().map(|o| o.counts[t]).sum::<u32>();
-    }
-    let np1 = nparts + 1;
-    let mut poff = vec![0u32; nt * np1];
-    for t in 0..nt {
-        poff[t * np1 + nparts] = off[t + 1];
-    }
-    let mut acc = off[..nt].to_vec();
-    let mut seen = 0;
-    for o in outs.iter_mut() {
-        let first = o.part as usize >= seen;
-        for t in 0..nt {
-            if first {
-                (seen..=o.part as usize).for_each(|p| poff[t * np1 + p] = acc[t]);
-            }
-            let c = o.counts[t];
-            o.counts[t] = acc[t]; // now the write cursor
-            acc[t] += c;
-        }
-        seen = seen.max(o.part as usize + 1);
-    }
-    for t in 0..nt {
-        (seen..nparts).for_each(|p| poff[t * np1 + p] = off[t + 1]);
-    }
-    drop(acc);
-    let total = off[nt] as usize;
-    let mut post = vec![0u16; total];
-    let pp = Ptr(post.as_mut_ptr());
-    std::thread::scope(|sc| {
-        for o in outs.iter_mut() {
-            let pp = &pp;
-            sc.spawn(move || {
-                let cu = &mut o.counts;
-                decode(&o.stream, |d, t| {
-                    unsafe { *pp.0.add(cu[t] as usize) = d };
-                    cu[t] += 1;
-                });
-                o.stream = Vec::new();
-            });
-        }
-    });
+    let total: usize = outs.iter().map(|o| o.post.len()).sum();
     let mut pres: Vec<Vec<u32>> = vec![Vec::new(); np];
     for o in &outs {
         for &(p, d) in &o.pm {
             pres[p as usize].push(d);
         }
     }
-    drop(outs);
     lap("csr");
     if dbg { eprintln!("nt {nt} nbm {nbm} list postings {total} phrases {np}"); }
     let bmw: &[u64] = &bmv;
@@ -868,10 +893,10 @@ fn main() {
             let i = t * w;
             Set::R(&bmw[i..i + w])
         } else {
-            let mut v = Vec::with_capacity((off[t + 1] - off[t]) as usize);
-            for p in 0..nparts {
-                let r = poff[t * np1 + p] as usize..poff[t * np1 + p + 1] as usize;
-                v.extend(post[r].iter().map(|&x| (p as u32) << 16 | x as u32));
+            let mut v = Vec::with_capacity(outs.iter().map(|o| (o.offs[t + 1] - o.offs[t]) as usize).sum());
+            for o in &outs {
+                let r = o.offs[t] as usize..o.offs[t + 1] as usize;
+                v.extend(o.post[r].iter().map(|&x| o.part << 16 | x as u32));
             }
             Set::L(v)
         }
