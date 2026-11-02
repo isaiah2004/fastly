@@ -295,12 +295,18 @@ unsafe fn work(t: usize, c: &Cx) {
 	let mut od: Vec<usize> = (0..tb.nid.load(Relaxed)).collect();
 	od.sort_unstable_by(|&p, &q| nm(p).cmp(nm(q)));
 	// per hour: count, scatter by endpoint rank, release the records, exact nearest-rank percentiles, format, write
+	// hours in index order, but the biggest first within each run of 12 (load swings 5x over a day): a shorter tail
+	let mut ord: Vec<usize> = (0..H).collect();
+	for b in ord.chunks_mut(12) {
+		b.sort_by_key(|&h| std::cmp::Reverse(c.top[h].load(Relaxed)));
+	}
 	let (mut cnt, mut off) = (vec![0u64; NE], vec![0u32; NE]); // cnt: count | errors<<32
 	loop {
-		let h = c.nx[0].fetch_add(1, Relaxed);
-		if h >= H {
+		let i = c.nx[0].fetch_add(1, Relaxed);
+		if i >= H {
 			break;
 		}
+		let h = ord[i];
 		cnt.fill(0);
 		each(c, h, |r, _| {
 			*cnt.get_unchecked_mut((r >> 21) as usize) += 1 | ((r >> 20 & 1) as u64) << 32;
