@@ -115,26 +115,16 @@ unsafe fn hour(s: *const u8) -> usize {
 	(if *s.add(6) == b'1' { d + 1 } else { d - 30 }) * 24 + b(11) * 10 + b(12) - 18
 }
 
-// f(line start, newline) for each line starting in [s, end). The newlines are listed first, two per 64 bytes
-// without branching (a line is over 32 bytes), so the line loop is predictable.
+// f(line start, newline) for each line starting in [s, end). Skip the fixed minimum prefix.
 #[inline(always)]
 unsafe fn lines(d: *const u8, mut s: usize, end: usize, mut f: impl FnMut(usize, usize)) {
-	let mut ix = std::mem::MaybeUninit::<[u32; CS / 32 + 32]>::uninit();
-	let (ix, mut n, mut b) = (ix.as_mut_ptr() as *mut u32, 0, s);
-	while b < end + 256 {
-		let mut m = v::mask(d.add(b), 10) as u64 | (v::mask(d.add(b + 32), 10) as u64) << 32;
-		let x = b + m.trailing_zeros() as usize;
-		*ix.add(n) = x as u32;
-		m &= m.wrapping_sub(1);
-		*ix.add(n + 1) = (b + m.trailing_zeros() as usize) as u32;
-		n += (m != 0) as usize + (x < b + 64) as usize;
-		b += 64;
-	}
-	for i in 0..n {
-		if s >= end {
-			break;
-		}
-		let nl = *ix.add(i) as usize;
+	while s < end {
+		let mut b = s + 39; // the shortest legal line has its LF at byte 39
+		let nl = loop {
+			let m = v::mask(d.add(b), 10);
+			if m != 0 { break b + m.trailing_zeros() as usize; }
+			b += 32;
+		};
 		f(s, nl);
 		s = nl + 1;
 	}
