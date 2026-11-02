@@ -12,4 +12,5 @@ T and M below come from a local laptop docker run (i5-12450H, shared with other 
 | 3 | Postings as a varint byte stream per worker, then a u16 CSR split into 65,536-doc partitions; bitmaps borrowed (not copied) by queries; large freed buffers go back to the OS (mallopt) | | ~0.33 | ~84 | |
 | 4 | An asm barrier stops LLVM from scalarizing the 64-bit AVX2 byte-class mask (Ir 688M to 559M) | | ~0.33 | ~84 | |
 | 6 | Postings sorted per sub-chunk by the index workers (in cache, no global count/prefix/scatter pass); 16-byte token entries (8+4 key bytes and a 32-bit hash; longer tokens resolved at once) instead of 40 (Ir 496M to 461M) | | ~0.33 | ~67 | |
+| 7 | Query file mmap'd and tokenized/hashed in parallel (serial intern only, with prefetch); renumbering by a u64-key unstable sort; BOOL terms numbered before phrase-only terms (compact per-term state); bitmap AND/OR/NOT with a borrowed bitmap in one pass | | ~0.29 | ~68 | |
 | 5 | AVX2 key load (one 32-byte load, OR 0x20, AND mask); newline mask from the same pass, so the doc-id check needs no extra load (Ir 559M to 498M) | | ~0.32 | ~85 | |

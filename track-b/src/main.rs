@@ -38,7 +38,10 @@ impl Tab {
         t
     }
     fn intern(&mut self, k: &Key) -> u32 {
-        let id = self.get(k);
+        self.intern_h(k, hk(k))
+    }
+    fn intern_h(&mut self, k: &Key, h: u64) -> u32 {
+        let id = self.get_h(k, h);
         if id != MISS {
             return id;
         }
@@ -46,7 +49,7 @@ impl Tab {
             *self = Tab::of(std::mem::take(&mut self.keys));
         }
         let m = self.slots.len() - 1;
-        let mut i = (hk(k) >> self.sh) as usize;
+        let mut i = (h >> self.sh) as usize;
         while self.slots[i].0 != 0 {
             i = (i + 1) & m;
         }
@@ -605,6 +608,11 @@ fn apply<'a>(r: Set<'a>, op: u8, s: Set<'a>, w: usize) -> Set<'a> {
         }
         (b'A', R(a)) if !sbits => L(sl.iter().copied().filter(|&x| tb(a, x)).collect()),
         (b'A', B(a)) if !sbits => L(sl.iter().copied().filter(|&x| tb(&a, x)).collect()),
+        (op, R(a)) if sbits => B(match op {
+            b'A' => a.iter().zip(sb).map(|(x, y)| x & y).collect(),
+            b'O' => a.iter().zip(sb).map(|(x, y)| x | y).collect(),
+            _ => a.iter().zip(sb).map(|(x, y)| x & !y).collect(),
+        }),
         (op, r) => {
             let mut a = own(r);
             match (op, sbits) {
@@ -704,38 +712,79 @@ fn main() {
         // fixed mmap threshold: big buffers go back to the OS when freed, which keeps the peak low
         unsafe { mallopt(-3, 1 << 17) };
     }
-    let qb = std::fs::read(format!("{data}/queries.txt")).unwrap();
+    let qb = load(&format!("{data}/queries.txt"));
     lap("qread");
     let buf = load(&format!("{data}/docs.txt"));
     lap("mapped");
 
     // ---- parse queries, intern terms
+    let nth = std::env::var("NT").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
     let mut tab = Tab::new((qb.len() / 12).next_power_of_two().trailing_zeros().max(4));
-    let mut intern = |t: &[u8]| tab.intern(&key_of(t));
-    let qb: &'static [u8] = Box::leak(qb.into_boxed_slice());
+    // In parallel: every query term as (B first BOOL term / A, O, N operator / P first phrase term / p, key, hash).
+    let toks: Vec<Vec<(u8, Key, u64)>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..nth)
+            .map(|i| {
+                let (a, b) = (line_start(qb, qb.len() * i / nth), line_start(qb, qb.len() * (i + 1) / nth));
+                sc.spawn(move || {
+                    let mut v = Vec::with_capacity((b - a) / 6);
+                    let mut add = |op: u8, w: &[u8]| {
+                        let k = key_of(w);
+                        v.push((op, k, hk(&k)));
+                    };
+                    for line in qb[a..b].split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
+                        if line.starts_with(b"BOOL ") {
+                            let mut op = b'B';
+                            for (i, wd) in line[5..].split(|&c| c == b' ').enumerate() {
+                                if i % 2 == 1 {
+                                    op = wd[0];
+                                } else {
+                                    add(op, wd);
+                                }
+                            }
+                        } else {
+                            line[8..line.len() - 1].split(|&c| c == b' ').enumerate().for_each(|(i, w)| add(if i == 0 { b'P' } else { b'p' }, w));
+                        }
+                    }
+                    v
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    lap("qtok");
     let mut qs = Vec::new();
     let mut ops: Vec<(u8, u32)> = Vec::new();
     let mut is_bool_term: Vec<bool> = Vec::new();
     let (mut p_terms, mut p_off) = (Vec::new(), vec![0u32]);
-    for line in qb.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
-        if line.starts_with(b"BOOL ") {
-            let st = ops.len();
-            let mut op = 0u8;
-            for (i, wd) in line[5..].split(|&c| c == b' ').enumerate() {
-                if i % 2 == 1 {
-                    op = wd[0];
-                } else {
-                    let t = intern(wd);
-                    ops.push((op, t));
-                }
+    let close = |qs: &mut Vec<Q>, ops: &Vec<(u8, u32)>, p_off: &mut Vec<u32>, p_terms: &Vec<u32>| match qs.last_mut() {
+        Some(Q::Bool(_, e)) => *e = ops.len(),
+        Some(Q::Phrase(_)) => p_off.push(p_terms.len() as u32),
+        None => {}
+    };
+    for v in &toks {
+        for (j, &(op, ref k, h)) in v.iter().enumerate() {
+            if let Some(x) = v.get(j + 16) {
+                tab.prefetch32((x.2 >> 32) as u32);
             }
-            qs.push(Q::Bool(st, ops.len()));
-        } else {
-            line[8..line.len() - 1].split(|&c| c == b' ').for_each(|w| p_terms.push(intern(w)));
-            qs.push(Q::Phrase(p_off.len() as u32 - 1));
-            p_off.push(p_terms.len() as u32);
+            let t = tab.intern_h(k, h);
+            match op {
+                b'B' | b'P' => {
+                    close(&mut qs, &ops, &mut p_off, &p_terms);
+                    if op == b'B' {
+                        qs.push(Q::Bool(ops.len(), 0));
+                        ops.push((0, t));
+                    } else {
+                        qs.push(Q::Phrase(p_off.len() as u32 - 1));
+                        p_terms.push(t);
+                    }
+                }
+                b'p' => p_terms.push(t),
+                _ => ops.push((op, t)),
+            }
         }
     }
+    close(&mut qs, &ops, &mut p_off, &p_terms);
+    drop(toks);
     lap("qloop");
     let nt = tab.keys.len();
     is_bool_term.resize(nt, false);
@@ -756,7 +805,6 @@ fn main() {
     let w = (n_docs + 63) / 64;
 
     // ---- sample 2 MB spread over the corpus (in parallel) to estimate document frequencies
-    let nth = std::env::var("NT").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
     let (mut sdf, mut sdocs) = (vec![0u32; nt], 0u32);
     for (d, n) in std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nth)
@@ -791,8 +839,9 @@ fn main() {
     // BOOL terms in more than 1/40 of the sample get a bitmap, the other ones a sorted list.
     // Renumber: bitmap terms first (bitmap index = id), then by sampled frequency so hot data shares cache lines.
     let isbm = |t: usize| is_bool_term[t] && sdf[t] as u64 * 40 >= sdocs as u64;
-    let mut perm: Vec<u32> = (0..nt as u32).collect();
-    perm.sort_by_key(|&t| (!isbm(t as usize), std::cmp::Reverse(sdf[t as usize])));
+    let mut pk: Vec<u64> = (0..nt).map(|t| ((!isbm(t) as u64) << 63 | (!is_bool_term[t] as u64) << 62 | ((u32::MAX - sdf[t]) as u64) << 24) | t as u64).collect();
+    pk.sort_unstable();
+    let perm: Vec<u32> = pk.iter().map(|&x| (x & 0xFF_FFFF) as u32).collect();
     let nbm = (0..nt).filter(|&t| isbm(t)).count();
     let mut nid = vec![0u32; nt];
     perm.iter().enumerate().for_each(|(n, &o)| nid[o as usize] = n as u32);
