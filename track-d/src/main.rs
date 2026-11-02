@@ -172,15 +172,22 @@ fn chunks(b: &[u8], start: usize, k: usize) -> Vec<(usize, usize)> {
 /// "look the weight up in `big`" (sorted by edge index; only huge weights).
 struct Csr {
     off: Vec<u32>,
-    v: Vec<u32>,
-    w: Vec<u16>,
+    e: Vec<E>,
     big: Vec<(u32, u32)>,
+}
+
+/// One edge in a row: head and (escaped) weight, 6 bytes, so a row is one stream.
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct E {
+    v: u32,
+    w: u16,
 }
 
 impl Csr {
     #[inline(always)]
     fn wt(&self, k: usize) -> u64 {
-        let w = unsafe { *self.w.get_unchecked(k) };
+        let w = unsafe { self.e.get_unchecked(k).w };
         if w != 0xFFFF { w as u64 } else { self.big[self.big.binary_search_by_key(&(k as u32), |x| x.0).unwrap()].1 as u64 }
     }
     fn row(&self, u: usize) -> std::ops::Range<usize> {
@@ -332,8 +339,7 @@ impl Buckets {
 struct Rows {
     len: usize,
     off: Vec<u32>,
-    v: Vec<u32>,
-    w: Vec<u16>,
+    e: Vec<E>,
     big: Vec<(u32, u32)>,
 }
 
@@ -342,12 +348,14 @@ struct Rows {
 /// `tag` gets (thread << 26) | (index in that thread's list) for every node.
 fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32]) -> Vec<Rows> {
     const CAP: usize = 16384;
+    const D1: usize = 16;
+    const D2: usize = 8;
     let claim = |v: usize, x: usize| tag[v].load(Relaxed) == NONE && tag[v].compare_exchange(NONE, x as u32, Relaxed, Relaxed).is_ok();
     let rg = |u: usize| g.row(u);
     par(nt, |t| {
         let mut list: Vec<u32> = Vec::with_capacity(n / nt * 5 / 4);
-        let c = g.v.len() / nt * 5 / 4;
-        let mut r = Rows { len: 0, off: Vec::with_capacity(n / nt * 5 / 4), v: Vec::with_capacity(c), w: Vec::with_capacity(c), big: Vec::new() };
+        let c = g.e.len() / nt * 5 / 4;
+        let mut r = Rows { len: 0, off: Vec::with_capacity(n / nt * 5 / 4), e: Vec::with_capacity(c), big: Vec::new() };
         for s in (n * t / nt)..(n * (t + 1) / nt) {
             if !claim(s, t << 26 | list.len()) {
                 continue;
@@ -356,7 +364,20 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32]) -> Vec<Rows> {
             list.push(s as u32);
             let mut q = start;
             while q < list.len() && list.len() - start < CAP {
-                for &v in &g.v[rg(list[q] as usize)] {
+                // two-stage prefetch: rows of the node D1 ahead, tags of the heads of the node D2 ahead
+                if let Some(&a) = list.get(q + D1) {
+                    let k = g.off[a as usize] as usize;
+                    pf(unsafe { g.e.as_ptr().add(k) });
+                }
+                if let Some(&a) = list.get(q + D2) {
+                    for x in &g.e[rg(a as usize)] {
+                        let v = x.v;
+                        pf(&tag[v as usize]);
+                        pf(&g.off[v as usize]);
+                    }
+                }
+                for x in &g.e[rg(list[q] as usize)] {
+                    let v = x.v;
                     if claim(v as usize, t << 26 | list.len()) {
                         list.push(v);
                     }
@@ -364,14 +385,13 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32]) -> Vec<Rows> {
                 q += 1;
             }
             for &u in &list[start..] {
-                r.off.push(r.v.len() as u32);
+                r.off.push(r.e.len() as u32);
                 for k in rg(u as usize) {
-                    if g.w[k] == 0xFFFF {
-                        r.big.push((r.v.len() as u32 + (k - g.off[u as usize] as usize) as u32, g.wt(k) as u32));
+                    if g.e[k].w == 0xFFFF {
+                        r.big.push((r.e.len() as u32 + (k - g.off[u as usize] as usize) as u32, g.wt(k) as u32));
                     }
                 }
-                r.v.extend_from_slice(&g.v[rg(u as usize)]);
-                r.w.extend_from_slice(&g.w[rg(u as usize)]);
+                r.e.extend_from_slice(&g.e[rg(u as usize)]);
             }
         }
         r.len = list.len();
@@ -501,13 +521,23 @@ fn pop(h: &mut Vec<u64>) -> u64 {
         if c >= len {
             break;
         }
-        let mut mc = c;
-        let mut mv = unsafe { *h.get_unchecked(c) };
-        for j in c + 1..(c + 4).min(len) {
-            let x = unsafe { *h.get_unchecked(j) };
-            if x < mv {
-                mv = x;
-                mc = j;
+        let (mut mc, mut mv);
+        if c + 4 <= len {
+            // branchless minimum of the four children
+            let g = |j: usize| unsafe { *h.get_unchecked(j) };
+            let (a, b, x, y) = (g(c), g(c + 1), g(c + 2), g(c + 3));
+            let (m1, i1) = if b < a { (b, c + 1) } else { (a, c) };
+            let (m2, i2) = if y < x { (y, c + 3) } else { (x, c + 2) };
+            (mv, mc) = if m2 < m1 { (m2, i2) } else { (m1, i1) };
+        } else {
+            mc = c;
+            mv = unsafe { *h.get_unchecked(c) };
+            for j in c + 1..len {
+                let x = unsafe { *h.get_unchecked(j) };
+                if x < mv {
+                    mv = x;
+                    mc = j;
+                }
             }
         }
         if mv >= last {
@@ -557,12 +587,11 @@ fn query<L: Lab>(g: [&Csr; 2], st: &mut St<L>, s: u32, t: u32, nb: u32) -> Optio
         let gr = g[sd];
         if let Some(&y) = st.heap[sd].first() {
             let k = unsafe { *gr.off.get_unchecked((y & mask) as usize) as usize };
-            pf(unsafe { gr.v.as_ptr().add(k) });
-            pf(unsafe { gr.w.as_ptr().add(k) });
+            pf(unsafe { gr.e.as_ptr().add(k) });
         }
         let (lo, hi) = unsafe { (*gr.off.get_unchecked(u as usize) as usize, *gr.off.get_unchecked(u as usize + 1) as usize) };
         for k in lo..hi {
-            let v = unsafe { *gr.v.get_unchecked(k) };
+            let v = unsafe { gr.e.get_unchecked(k).v };
             let nd = d + gr.wt(k);
             if nd < mu {
                 if nd >= lim {
@@ -603,7 +632,7 @@ fn slow(g: &Csr, s: u32, t: u32) -> u64 {
             return d;
         }
         for k in g.row(u as usize) {
-            let (v, nd) = (g.v[k], d + g.wt(k));
+            let (v, nd) = (g.e[k].v, d + g.wt(k));
             if dist.get(&v).map_or(true, |&o| nd < o) {
                 dist.insert(v, nd);
                 h.push(Reverse((nd, v)));
@@ -704,10 +733,10 @@ fn main() {
     let mut off0 = deg;
     prefix(&mut off0, nt);
     let m = off0[n] as usize;
-    let (mut v0, mut w0): (Vec<u32>, Vec<u16>) = (uninit(m), uninit(m));
-    let (vp, wp) = (P(v0.as_mut_ptr()), P(w0.as_mut_ptr()));
+    let mut e0: Vec<E> = uninit(m);
+    let ep = P(e0.as_mut_ptr());
     let mut big: Vec<(u32, u32)> = par(nt, |t| {
-        let (vp, wp) = (vp, wp);
+        let ep = ep;
         let mut big = Vec::new();
         let mut cur = Vec::new();
         for j in t * SUB..(t + 1) * SUB {
@@ -716,19 +745,13 @@ fn main() {
             for p in &parts {
                 p.each(j, |x| {
                     let k = unsafe { cur.get_unchecked_mut((x >> vs) as usize) };
-                    unsafe {
-                        *vp.0.add(*k as usize) = (x >> 16 & vm) as u32;
-                        *wp.0.add(*k as usize) = x as u16;
-                    }
+                    unsafe { *ep.0.add(*k as usize) = E { v: (x >> 16 & vm) as u32, w: x as u16 } };
                     *k += 1;
                 });
             }
             for e in huge.iter().filter(|e| sown(e[0]) == j) {
                 let k = &mut cur[e[0] as usize - slo(j)];
-                unsafe {
-                    *vp.0.add(*k as usize) = e[1];
-                    *wp.0.add(*k as usize) = 0xFFFF;
-                }
+                unsafe { *ep.0.add(*k as usize) = E { v: e[1], w: 0xFFFF } };
                 big.push((*k, e[2]));
                 *k += 1;
             }
@@ -738,7 +761,7 @@ fn main() {
     .concat();
     big.sort_unstable();
     drop(parts);
-    let g0 = Csr { off: off0, v: v0, w: w0, big };
+    let g0 = Csr { off: off0, e: e0, big };
     lap("csr0");
     let mut perm = vec![NONE; n];
     let parts = order(&g0, n, nt, atomics(&mut perm));
@@ -746,7 +769,7 @@ fn main() {
     let (mut nb0, mut eb0) = (vec![0usize], vec![0usize]);
     for p in &parts {
         nb0.push(nb0.last().unwrap() + p.len);
-        eb0.push(eb0.last().unwrap() + p.v.len());
+        eb0.push(eb0.last().unwrap() + p.e.len());
     }
     let pp = P(perm.as_mut_ptr());
     par(nt, |t| {
@@ -759,26 +782,23 @@ fn main() {
     lap("order");
     // forward CSR in the new numbering: the copied rows, heads renamed
     let mut off: Vec<u32> = uninit(n + 1);
-    let (mut fv, mut fw): (Vec<u32>, Vec<u16>) = (uninit(m), uninit(m));
-    let (op, vp, wp) = (P(off.as_mut_ptr()), P(fv.as_mut_ptr()), P(fw.as_mut_ptr()));
+    let mut fe: Vec<E> = uninit(m);
+    let (op, ep) = (P(off.as_mut_ptr()), P(fe.as_mut_ptr()));
     let big = par(nt, |t| {
-        let (op, vp, wp) = (op, vp, wp);
+        let (op, ep) = (op, ep);
         let r = &parts[t];
         for (i, &o) in r.off.iter().enumerate() {
             unsafe { *op.0.add(nb0[t] + i) = (eb0[t] + o as usize) as u32 };
         }
-        for (j, (&v, &w)) in r.v.iter().zip(&r.w).enumerate() {
-            unsafe {
-                *vp.0.add(eb0[t] + j) = perm[v as usize];
-                *wp.0.add(eb0[t] + j) = w;
-            }
+        for (j, x) in r.e.iter().enumerate() {
+            unsafe { *ep.0.add(eb0[t] + j) = E { v: perm[x.v as usize], w: x.w } };
         }
         r.big.iter().map(|&(j, w)| (eb0[t] as u32 + j, w)).collect::<Vec<_>>()
     })
     .concat();
     off[n] = m as u32;
     drop(parts);
-    let fwd = Csr { off, v: fv, w: fw, big };
+    let fwd = Csr { off, e: fe, big };
     // distinct queries (duplicate lines are answered once)
     let (mut qs, mut qi, mut seen) = (Vec::new(), Vec::new(), std::collections::HashMap::new());
     let mut i = 0;
@@ -801,7 +821,7 @@ fn main() {
         let mut cr = vec![Vec::new(); nt];
         for u in lo(t)..lo(t + 1) {
             for k in fwd.row(u) {
-                let v = fwd.v[k];
+                let v = fwd.e[k].v;
                 if own(v) == t {
                     unsafe { *rp.0.add(v as usize) += 1 };
                 } else {
@@ -818,20 +838,17 @@ fn main() {
         }
     });
     prefix(&mut roff, nt);
-    let (mut rv, mut rw): (Vec<u32>, Vec<u16>) = (uninit(m), uninit(m));
-    let (vp, wp) = (P(rv.as_mut_ptr()), P(rw.as_mut_ptr()));
+    let mut re: Vec<E> = uninit(m);
+    let ep = P(re.as_mut_ptr());
     let mut big = par(nt, |t| {
-        let (vp, wp) = (vp, wp);
+        let ep = ep;
         let base = lo(t);
         let mut cur = roff[base..lo(t + 1)].to_vec();
         let mut big = Vec::new();
         let mut put = |v: u32, u: u32, k: usize| {
             let c = &mut cur[v as usize - base];
-            let w = fwd.w[k];
-            unsafe {
-                *vp.0.add(*c as usize) = u;
-                *wp.0.add(*c as usize) = w;
-            }
+            let w = fwd.e[k].w;
+            unsafe { *ep.0.add(*c as usize) = E { v: u, w } };
             if w == 0xFFFF {
                 big.push((*c, fwd.wt(k) as u32));
             }
@@ -839,8 +856,8 @@ fn main() {
         };
         for u in base..lo(t + 1) {
             for k in fwd.row(u) {
-                if own(fwd.v[k]) == t {
-                    put(fwd.v[k], u as u32, k);
+                if own(fwd.e[k].v) == t {
+                    put(fwd.e[k].v, u as u32, k);
                 }
             }
         }
@@ -852,7 +869,7 @@ fn main() {
     .concat();
     big.sort_unstable();
     drop(cross);
-    let bwd = Csr { off: roff, v: rv, w: rw, big };
+    let bwd = Csr { off: roff, e: re, big };
     lap("csr");
 
     let ans: Vec<AtomicU64> = (0..qs.len()).map(|_| AtomicU64::new(0)).collect();
