@@ -4,7 +4,7 @@ use std::{fs::File, os::unix::fs::FileExt, sync::Barrier, sync::Mutex};
 
 const H: usize = 72; // hours in the fixed window
 const NE: usize = 2048; // max distinct endpoints (the catalogue has 1,842)
-const TS: usize = 4096; // intern table slots
+const TS: usize = 8192; // intern table slots (under a quarter full)
 const CS: usize = 64 << 10; // input chunk, read into a buffer that stays in L2
 const PAD: usize = 512; // read past a chunk: its last line (under 200 bytes) and the SIMD reads past a line start
 const BLK: usize = 512; // records per block
@@ -16,7 +16,7 @@ const OC: usize = NE * 256; // output bytes per hour, at most: a line per endpoi
 // BLK records in the hour's region; FILL ends a block early. Loc: per hour, a thread's write position and block end.
 type Loc = [(u32, u32); H];
 
-// endpoint intern table shared by all threads: slot = hash<<32 | len<<16 | id+1; bytes in ent[slot]
+// endpoint intern table shared by all threads: slot = hash<<32 | len<<16 | id+1; bytes in ent[id]
 #[repr(align(64))]
 struct Ent([u8; 128]);
 struct Tab {
@@ -36,15 +36,15 @@ unsafe fn find(tb: &Tab, e: *const u8, n: usize, hv: u64) -> usize {
 		let sl = tb.slot.get_unchecked(s);
 		let t = sl.load(Acquire);
 		if t >> 16 == tag >> 16 {
-			if v::eq(e, n, (*tb.ent.add(s)).0.as_ptr()) {
+			if v::eq(e, n, (*tb.ent.add((t & 0xffff) as usize - 1)).0.as_ptr()) {
 				return (t & 0xffff) as usize - 1;
 			}
 		} else if t <= 1 {
 			// empty, or another thread is inserting here
 			if t == 0 && sl.compare_exchange(0, 1, Acquire, Relaxed).is_ok() {
-				std::ptr::copy_nonoverlapping(e, (*tb.ent.add(s)).0.as_mut_ptr(), n);
 				let id = tb.nid.fetch_add(1, Relaxed);
 				assert!(id < NE - 1);
+				std::ptr::copy_nonoverlapping(e, (*tb.ent.add(id)).0.as_mut_ptr(), n);
 				tb.gs[id].store(s as u32, Relaxed);
 				sl.store(tag | (id as u64 + 1), Release);
 				return id;
@@ -290,7 +290,7 @@ unsafe fn work(t: usize, c: &Cx) {
 	// endpoint ids in byte order (each thread sorts its own copy)
 	let nm = |g: usize| {
 		let s = tb.gs[g].load(Relaxed) as usize;
-		&(&(*tb.ent.add(s)).0)[..(tb.slot[s].load(Relaxed) >> 16 & 255) as usize]
+		&(&(*tb.ent.add(g)).0)[..(tb.slot[s].load(Relaxed) >> 16 & 255) as usize]
 	};
 	let mut od: Vec<usize> = (0..tb.nid.load(Relaxed)).collect();
 	od.sort_unstable_by(|&p, &q| nm(p).cmp(nm(q)));
@@ -344,10 +344,11 @@ unsafe fn work(t: usize, c: &Cx) {
 				[p50, p95, *v[r95..].select_nth_unstable(r99 - 1 - r95).1]
 				}
 			};
-			for b in [&hs[..], nm(id)] {
-				std::ptr::copy_nonoverlapping(b.as_ptr(), q, b.len());
-				q = q.add(b.len());
-			}
+			// the name's whole 128-byte entry is copied (no length-dependent copy); what follows the name overwrites the rest
+			let m = nm(id);
+			std::ptr::copy_nonoverlapping(hs.as_ptr(), q, 21);
+			std::ptr::copy_nonoverlapping(m.as_ptr(), q.add(21), 128);
+			q = q.add(21 + m.len());
 			let pm = (e as u64 * 1_000_000 / n as u64) as u32;
 			for x in [n as u32, ps[0], ps[1], ps[2], e, pm] {
 				q = num(q, x);
@@ -391,7 +392,7 @@ fn main() {
 		bar: Barrier::new(nt),
 		tb: Tab {
 			slot: (0..TS).map(|_| AtomicU64::new(0)).collect(),
-			ent: arena(TS * 128) as _,
+			ent: arena(NE * 128) as _,
 			nid: AU::new(0),
 			gs: (0..NE).map(|_| AtomicU32::new(0)).collect(),
 		},
