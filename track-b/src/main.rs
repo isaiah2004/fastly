@@ -361,7 +361,7 @@ impl<T> Ptr<T> {
     }
 }
 
-// One output (at most 32768 docs, within one round): postings of the list terms as
+// One output (at most 32768 docs, one 65536-doc partition): postings of the list terms as
 // the low 16 bits of the doc ids, list term lo + t at post[offs[t]..offs[t + 1]]; phrase matches.
 struct WOut {
     offs: Vec<u32>,
@@ -507,8 +507,8 @@ impl W {
     }
 }
 
-// Index the docs from byte a to byte b (at most 32768 docs).
-fn worker(c: &Ctx, a: usize, b: usize) -> WOut {
+// Index the docs from bounds[0] to the last bound, one output per pair of bounds (at most 32768 docs).
+fn worker(c: &Ctx, bounds: &[usize]) -> Vec<WOut> {
     let buf = c.buf;
     let nt = c.nl;
     let mut w = W {
@@ -518,7 +518,12 @@ fn worker(c: &Ctx, a: usize, b: usize) -> WOut {
         blk: usize::MAX,
         ..Default::default()
     };
-    {
+    let mut outs = Vec::new();
+    for r in bounds.windows(2) {
+        let (a, b) = (r[0], r[1]);
+        if a == b {
+            continue;
+        }
         let mut doc;
         w.lc.fill([u16::MAX, 0]);
         w.base = parse_u32(&buf[a..a + buf[a..].iter().position(|&c| c == b'\t').unwrap()]);
@@ -575,13 +580,15 @@ fn worker(c: &Ctx, a: usize, b: usize) -> WOut {
             *post.get_unchecked_mut(*o as usize) = d;
             *o += 1;
         });
-        w.flush(c);
-        WOut {
+        w.stream.clear();
+        outs.push(WOut {
             offs,
             post,
-            pm: w.pm,
-        }
+            pm: std::mem::take(&mut w.pm),
+        });
     }
+    w.flush(c);
+    outs
 }
 
 // A set of doc ids: a sorted list, an owned bitmap or a borrowed (index) bitmap.
@@ -769,15 +776,11 @@ enum Q {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let mut data = "/data".to_string();
-    let mut out = "/out".to_string();
-    for i in 1..args.len() {
-        if args[i] == "--data" {
-            data = args[i + 1].clone();
-        } else if args[i] == "--out" {
-            out = args[i + 1].clone();
-        }
-    }
+    let arg = |f: &str, d: &str| {
+        let i = args.iter().position(|a| a == f);
+        i.map_or(d.to_string(), |i| args[i + 1].clone())
+    };
+    let (data, out) = (arg("--data", "/data"), arg("--out", "/out"));
     #[cfg(target_os = "linux")]
     {
         extern "C" {
@@ -920,9 +923,9 @@ fn main() {
         sdocs += n;
     }
     let sdocs = sdocs.max(1);
-    // BOOL terms in more than 1/120 of the sample get a bitmap, the other ones a sorted list.
+    // BOOL terms in more than 1/40 of the sample get a bitmap, the other ones a sorted list.
     // Renumber: bitmap terms first (bitmap index = id), then by sampled frequency so hot data shares cache lines.
-    let isbm = |t: usize| is_bool_term[t] && sdf[t] as u64 * 120 >= sdocs as u64;
+    let isbm = |t: usize| is_bool_term[t] && sdf[t] as u64 * 40 >= sdocs as u64;
     let mut pk: Vec<u64> = (0..nt)
         .map(|t| {
             ((!isbm(t) as u64) << 63
@@ -982,9 +985,9 @@ fn main() {
     }
     tab.renumber(&nid, &flags);
     tab.drop_keys();
-    // Rounds of 32768 docs: index a round, answer every BOOL query on it, add up the results. Only
+    // Rounds of 65536 docs: index a round, answer every BOOL query on it, add up the results. Only
     // one round's index is alive at a time; within a round doc ids are their low 16 bits.
-    let rd = 1 << 15; // docs per round
+    let rd = 1 << 16; // docs per round
     let wr = w.min(rd / 64);
     // row stride padded by 64 bytes: power-of-two strides put every row's current word in one L1 set
     let stride = wr + 8;
@@ -1035,7 +1038,8 @@ fn main() {
         }
         ctx.d0 = d0;
         let ctx = &ctx;
-        // ---- parallel index pass over the round; chunks start at doc ids that are multiples of 64
+        // ---- parallel index pass over the round; chunks start at doc ids that are multiples of 64,
+        // outputs of at most 32768 docs
         let outs: Vec<WOut> = par(nth, |i| {
             // equal bytes per thread, cut at docs that are multiples of 64
             let (rs, re) = (at_doc(d0 as usize), at_doc(d0 as usize + rd));
@@ -1048,7 +1052,13 @@ fn main() {
                 }
             };
             let (a, b) = (cut(i), cut(i + 1));
-            (a < b.min(n_docs)).then(|| worker(ctx, at_doc(a), at_doc(b)))
+            let mut ds: Vec<usize> = (a..b).step_by(1 << 15).collect();
+            ds.push(b);
+            if a < b.min(n_docs) {
+                worker(ctx, &ds.into_iter().map(|d| at_doc(d)).collect::<Vec<_>>())
+            } else {
+                vec![]
+            }
         })
         .into_iter()
         .flatten()
