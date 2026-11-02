@@ -144,6 +144,7 @@ struct Line([AtomicU64; 8]);
 struct Names<'a> {
     d: &'a [u8],
     t: &'static [Line],
+    tags: &'static [AtomicU8], // per slot: 0 empty, else 8 hash bits (probed in L1 before the line)
     nt: usize,
     overflow: AtomicBool,
 }
@@ -192,6 +193,10 @@ const HIGH: [u64; 9] = {
 fn home(m0: u64) -> usize {
     (m0 >> 32) as usize & (NS - 1)
 }
+#[inline(always)]
+fn tag(m0: u64) -> u8 {
+    (m0 >> 56) as u8 | 1
+}
 const LMAX: usize = 1 << 22;
 impl<'a> Names<'a> {
     /// The message (group not yet set) for the name at d[o..o + l].
@@ -220,31 +225,50 @@ impl<'a> Names<'a> {
     fn owner(&self, m0: u64) -> usize {
         home(m0) * self.nt >> NB
     }
+    /// The first slot from m0's home on that is empty or carries its tag. The slots before it hold
+    /// other names, and slots are never cleared, so a later probe may start there.
+    #[inline(always)]
+    fn guess(&self, m0: u64, o: &Own) -> usize {
+        let (tg, mut i) = (tag(m0), home(m0));
+        while !matches!(self.tags[i].load(Relaxed), x if x == 0 || x == tg) {
+            i = if i + 1 == o.hi { o.lo } else { i + 1 };
+        }
+        i
+    }
     /// Owner side: find or insert each message's name in the owner's range and set its group bit.
     fn apply(&self, ms: &[Msg], o: &mut Own) {
         if self.overflow.load(Relaxed) {
             return;
         }
         const PF: usize = 8;
+        let mut ring = [0; PF];
+        for (j, m) in ms.iter().enumerate().take(PF) {
+            ring[j] = self.guess(m[0], o);
+            prefetch(&self.t[ring[j]]);
+        }
         for (j, m) in ms.iter().enumerate() {
+            let mut i = ring[j % PF];
             if let Some(n) = ms.get(j + PF) {
-                prefetch(&self.t[home(n[0])]);
+                ring[j % PF] = self.guess(n[0], o);
+                prefetch(&self.t[ring[j % PF]]);
             }
             let (g, hdr) = ((m[0] >> 2) as usize & 255, m[0] & !(255 << 2));
             let l = (m[0] >> 10) as usize & (LMAX - 1);
-            let mut i = home(m[0]);
+            let tg = tag(m[0]);
             loop {
                 let sl = &self.t[i].0;
-                let hd = sl[0].load(Relaxed);
-                if hd == 0 {
+                let t = self.tags[i].load(Relaxed);
+                if t == 0 {
                     o.n += 1;
                     if o.n > (o.hi - o.lo) / 8 * 7 {
                         return self.overflow.store(true, Relaxed);
                     }
                     (1..4).for_each(|k| sl[k].store(m[k], Relaxed));
                     sl[0].store(hdr, Relaxed);
+                    self.tags[i].store(tg, Relaxed);
                     break;
                 }
+                let hd = if t == tg { sl[0].load(Relaxed) } else { 0 };
                 let same = |k: usize| sl[k].load(Relaxed) == m[k];
                 let long = |p: u64, q: u64| self.d[p as usize..][..l] == self.d[q as usize..][..l];
                 if hd == hdr && if l <= 24 { same(1) && same(2) && same(3) } else { long(sl[1].load(Relaxed), m[1]) } {
@@ -570,7 +594,8 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
     let rg = reg_new(rd).filter(|_| len < u32::MAX as usize)?; // staged lengths are 32-bit
     let t = unsafe { std::slice::from_raw_parts(zalloc(NS * 64, true) as *const Line, NS) };
     let overflow = AtomicBool::new(false);
-    let names = Names { d, t, nt, overflow };
+    let tags = unsafe { std::slice::from_raw_parts(zalloc(NS, false) as *const AtomicU8, NS) };
+    let names = Names { d, t, tags, nt, overflow };
     let stk = || Vec::from_iter((0..nt).map(|_| Stack(AtomicPtr::default())));
     let (inbox, spare) = (stk(), stk());
     // owner o has exactly the slots i with i * nt >> NB == o
