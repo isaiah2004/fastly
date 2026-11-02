@@ -84,10 +84,17 @@ impl Tab {
         self.keys = Vec::new();
     }
     // New ids (nid[old]) with their flags (f[new]) in the top byte.
-    fn renumber(&mut self, nid: &[u32], f: &[u8]) {
-        for s in self.slots.iter_mut().filter(|s| s.0 != 0) {
-            s.2 = nid[s.2 as usize] | (f[nid[s.2 as usize] as usize] as u32) << 24;
-        }
+    // (in parallel on n threads)
+    fn renumber(&mut self, nid: &[u32], f: &[u8], n: usize) {
+        let (l, p) = (self.slots.len(), Ptr(self.slots.as_mut_ptr()));
+        par(n, |i| {
+            let s = unsafe {
+                std::slice::from_raw_parts_mut(p.at(l * i / n), l * (i + 1) / n - l * i / n)
+            };
+            for s in s.iter_mut().filter(|s| s.0 != 0) {
+                s.2 = nid[s.2 as usize] | (f[nid[s.2 as usize] as usize] as u32) << 24;
+            }
+        });
         self.miss = nid.len() as u32;
     }
     #[inline(always)]
@@ -902,13 +909,19 @@ fn main() {
             line_start(qb, qb.len() * (i + 1) / qt),
         );
         let mut v = Vec::with_capacity((b - a) / 5);
+        // (bytes 0..8, 8..12 of the term, top 24 bits of its hash | op); a longer term:
+        // (offset, length | 1 << 31, ..)
         let mut add = |op: u8, w: &[u8]| {
-            v.push((
-                hk(&key_of(w)),
-                (w.as_ptr() as usize - qb.as_ptr() as usize) as u32,
-                w.len() as u8,
-                op,
-            ))
+            let k = key_of(w);
+            let h = (hk(&k) >> 32) as u32 & !0xFF | op as u32;
+            v.push(match w.len() {
+                0..=12 => (k[0], k[1] as u32, h),
+                l => (
+                    (w.as_ptr() as usize - qb.as_ptr() as usize) as u64,
+                    l as u32 | 1 << 31,
+                    h,
+                ),
+            })
         };
         for line in qb[a..b].split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
             if line.starts_with(b"BOOL ") {
@@ -929,16 +942,22 @@ fn main() {
         }
         v
     });
+    let nk: usize = toks.iter().map(|v| v.len()).sum();
+    tab.keys.reserve(nk); // (untouched capacity stays unmapped)
     let mut qs = Vec::new();
-    let mut ops: Vec<(u8, u32)> = Vec::new();
+    let mut ops: Vec<(u8, u32)> = Vec::with_capacity(nk);
     let mut is_bool_term: Vec<bool> = Vec::new();
-    let (mut p_terms, mut p_off, mut pq) = (Vec::new(), Vec::new(), Vec::new()); // phrase terms, starts, query
+    let (mut p_terms, mut p_off, mut pq) = (Vec::with_capacity(nk), Vec::new(), Vec::new()); // phrase terms, starts, query
     for v in &toks {
-        for (j, &(h, o, l, op)) in v.iter().enumerate() {
+        for (j, &(a, b, h)) in v.iter().enumerate() {
             if let Some(x) = v.get(j + 16) {
-                tab.prefetch32((x.0 >> 32) as u32);
+                tab.prefetch32(x.2);
             }
-            let t = tab.intern_h(&key_of(&qb[o as usize..o as usize + l as usize]), h);
+            let k = match b >> 31 {
+                0 => [a, b as u64, 0, 0],
+                _ => key_of(&qb[a as usize..a as usize + (b & 0xFF) as usize]),
+            };
+            let (t, op) = (tab.intern_h(&k, (h as u64) << 32), h as u8);
             match op {
                 b'B' => {
                     qs.push(Q::Bool(ops.len()));
@@ -1078,7 +1097,7 @@ fn main() {
         kl[kcnt[t] as usize] = (i as u32, pkey[i]);
         kcnt[t] += 1;
     }
-    tab.renumber(&nid, &flags);
+    tab.renumber(&nid, &flags, st);
     tab.drop_keys(&nid);
     // Rounds of 65536 docs: index a round, answer every BOOL query on it, add up the results. Only
     // one round's index is alive at a time; within a round doc ids are their low 16 bits.
