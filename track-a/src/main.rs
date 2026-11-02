@@ -121,9 +121,9 @@ unsafe fn lines(d: *const u8, mut s: usize, end: usize, mut f: impl FnMut(usize,
 	while s < end {
 		let mut b = s + 39; // the shortest legal line has its LF at byte 39
 		let nl = loop {
-			let m = v::mask(d.add(b), 10);
+			let m = v::mask(d.add(b), 10) as u64 | (v::mask(d.add(b + 32), 10) as u64) << 32;
 			if m != 0 { break b + m.trailing_zeros() as usize; }
-			b += 32;
+			b += 64;
 		};
 		f(s, nl);
 		s = nl + 1;
