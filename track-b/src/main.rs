@@ -474,18 +474,47 @@ impl W {
             (st.add(l0 + c.ew) as *mut u32).write_unaligned(doc);
         }
         let (mut sl, mut kl) = (l0 + c.ew + 4, 0);
-        for (pos, &(k0, k1, h)) in self.ks.iter().enumerate() {
-            c.tab
-                .prefetch32(unsafe { (*self.ks.as_ptr().add(pos + PD)).2 });
+        let (ks, ids, kp, lo, ew) = (
+            self.ks.as_ptr(),
+            self.ids.as_mut_ptr(),
+            self.kp.as_mut_ptr(),
+            c.lo,
+            c.ew,
+        );
+        // the table, in locals (the stores below would otherwise make it reload per token)
+        let (sp, m, sh, miss) = (
+            c.tab.slots.as_ptr(),
+            c.tab.slots.len() - 1,
+            c.tab.sh - 32,
+            c.tab.miss,
+        );
+        for pos in 0..n {
+            let (k0, k1, h) = unsafe { *ks.add(pos) };
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use std::arch::x86_64::*;
+                let h = (*ks.add(pos + PD)).2;
+                _mm_prefetch(sp.add((h >> sh) as usize) as *const i8, _MM_HINT_T0);
+            }
             let r = if k1 == u32::MAX {
                 k0 as u32
             } else {
-                c.tab.get12(k0, k1, h)
+                let mut i = (h >> sh) as usize;
+                loop {
+                    let s = unsafe { *sp.add(i) };
+                    if s.0 == k0 && s.1 == k1 {
+                        break s.2;
+                    }
+                    if s.0 == 0 {
+                        break miss;
+                    }
+                    i = (i + 1) & m;
+                }
             };
             let ti = (r & 0xFF_FFFF) as usize;
             let fl = r >> 24; // 1 list, 2 bitmap (bitmap index = id), 4 phrase key
             unsafe {
-                *self.ids.as_mut_ptr().add(pos) = ti as u32;
+                *ids.add(pos) = ti as u32;
                 if fl & 2 != 0 {
                     *sb.add(ti) |= bit;
                 }
@@ -494,12 +523,12 @@ impl W {
                     if e[0] != rel {
                         e[0] = rel;
                         e[1] += 1;
-                        (st.add(sl) as *mut u32).write_unaligned((ti - c.lo) as u32 + 1);
-                        sl += c.ew;
+                        (st.add(sl) as *mut u32).write_unaligned((ti - lo) as u32 + 1);
+                        sl += ew;
                     }
                 }
                 if fl & 4 != 0 {
-                    *self.kp.as_mut_ptr().add(kl) = pos as u32; // rare (2% of tokens)
+                    *kp.add(kl) = pos as u32; // rare (2% of tokens)
                     kl += 1;
                 }
             }
