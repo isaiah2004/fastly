@@ -8,11 +8,11 @@ const TS: usize = 8192; // intern table slots (under a quarter full)
 const CS: usize = 64 << 10; // input chunk, read into a buffer that stays in L2
 const PAD: usize = 512; // read past a chunk: its last line (under 200 bytes) and the SIMD reads past a line start
 const BLK: usize = 512; // records per block
-const ESC: u32 = 0xfffff; // latency field value: the latency is in the next record
-const FILL: u32 = u32::MAX; // unused tail of a block
+const ESC: u32 = 0xfffff; // latency field value: the latency is in the hour's side list
+const FILL: u32 = (NE as u32 - 1) << 21; // unused tail of a block: a record of the reserved last id
 const OC: usize = NE * 256; // output bytes per hour, at most: a line per endpoint
 
-// A record per line: id<<21 | error<<20 | latency, or ESC and then the latency. Threads append them to blocks of
+// A record per line: id<<21 | error<<20 | latency (ESC: in the side list `big`). Threads append them to blocks of
 // BLK records in the hour's region; FILL ends a block early. Loc: per hour, a thread's write position and block end.
 type Loc = [(u32, u32); H];
 
@@ -80,10 +80,13 @@ mod v {
 	// the k-th smallest (from 0) of v (at most 8M values) for each k: the largest value with fewer than k+1 values below it
 	#[inline(always)]
 	pub unsafe fn rk<const M: usize>(v: &[u32], ks: [usize; 3]) -> [u32; 3] {
-		let mut a = [u32::MAX; 64];
-		a[..v.len()].copy_from_slice(v);
-		let (ld, sg) = (|i: usize| _mm256_loadu_si256(a.as_ptr().add(8 * i) as _), _mm256_set1_epi32(i32::MIN));
-		let x: [__m256i; M] = std::array::from_fn(|i| _mm256_xor_si256(ld(i), sg));
+		// vector i: lanes 8i.. of v, masked loads (no memcpy), lanes past the end set to MAX
+		let (n, io, sg) = (v.len() as i32, _mm256_cvtepi8_epi32(_mm_loadl_epi64(IO.as_ptr() as _)), _mm256_set1_epi32(i32::MIN));
+		let a: [__m256i; M] = std::array::from_fn(|i| {
+			let m = _mm256_cmpgt_epi32(_mm256_set1_epi32(n - 8 * i as i32), io);
+			_mm256_or_si256(_mm256_maskload_epi32(v.as_ptr().add(8 * i) as _, m), _mm256_xor_si256(m, _mm256_set1_epi32(-1)))
+		});
+		let x = a.map(|y| _mm256_xor_si256(y, sg));
 		let mut c = [_mm256_setzero_si256(); M];
 		for &y in v {
 			let b = _mm256_set1_epi32((y ^ 1 << 31) as i32);
@@ -94,7 +97,7 @@ mod v {
 		ks.map(|k| {
 			let mut m = _mm256_setzero_si256();
 			for i in 0..M {
-				m = _mm256_max_epu32(m, _mm256_and_si256(_mm256_cmpgt_epi32(_mm256_set1_epi32(k as i32 + 1), c[i]), ld(i)));
+				m = _mm256_max_epu32(m, _mm256_and_si256(_mm256_cmpgt_epi32(_mm256_set1_epi32(k as i32 + 1), c[i]), a[i]));
 			}
 			let m = _mm_max_epu32(_mm256_castsi256_si128(m), _mm256_extracti128_si256(m, 1));
 			let m = _mm_max_epu32(m, _mm_shuffle_epi32(m, 0b1110));
@@ -157,8 +160,8 @@ unsafe fn lines(d: *const u8, mut s: usize, end: usize, mut f: impl FnMut(usize,
 // a new block for hour h
 #[cold]
 unsafe fn nb(h: usize, c: (u32, u32), cx: &Cx) -> (u32, u32) {
-	if c.0 < c.1 {
-		*cx.rec.add(c.0 as usize) = FILL;
+	for k in c.0..c.1 {
+		*cx.rec.add(k as usize) = FILL;
 	}
 	let s = cx.top[h].fetch_add(BLK, Relaxed);
 	assert!(s + BLK <= cx.cap);
@@ -182,30 +185,21 @@ unsafe fn pass(d: *const u8, p: usize, end: usize, l: &mut Loc, cx: &Cx) {
 		let id = find(tb, d.add(es), n, hash(d.add(es), n)) as u32;
 		let lat = v::lat(d.add(nl - 16), 15 - ls);
 		let mut c = *l.get_unchecked(h);
-		if c.0 + 2 > c.1 {
+		if c.0 >= c.1 {
 			c = nb(h, c, cx);
 		}
 		*r.add(c.0 as usize) = id << 21 | ((*d.add(sp - 3) == b'5') as u32) << 20 | lat.min(ESC);
-		*r.add(c.0 as usize + 1) = lat;
-		c.0 += 1 + (lat >= ESC) as u32;
+		if lat >= ESC {
+			*cx.big.add(h * cx.cap + cx.bt[h].fetch_add(1, Relaxed)) = (id as u64) << 32 | lat as u64;
+		}
+		c.0 += 1;
 		*l.get_unchecked_mut(h) = c;
 	})
 }
 
-// f(record, latency) for every line of hour h
-unsafe fn each(c: &Cx, h: usize, mut f: impl FnMut(u32, u32)) {
-	let (mut k, r) = (h * c.cap, c.rec);
-	let e = k + c.top[h].load(Relaxed);
-	while k < e {
-		let x = *r.add(k);
-		if x == FILL {
-			k = (k | (BLK - 1)) + 1;
-			continue;
-		}
-		let esc = x & ESC == ESC;
-		f(x, if esc { *r.add(k + 1) } else { x & ESC });
-		k += 1 + esc as usize;
-	}
+// f(record) for every record of hour h (block tails are FILL records)
+unsafe fn each(c: &Cx, h: usize, f: impl FnMut(&u32)) {
+	std::slice::from_raw_parts(c.rec.add(h * c.cap), c.top[h].load(Relaxed)).iter().for_each(f);
 }
 
 const LUT: [u8; 200] = {
@@ -259,6 +253,8 @@ struct Cx {
 	txt: *mut u8,  // per hour: OC bytes of output
 	cap: usize,
 	top: Vec<AU>, // records used per region
+	big: *mut u64, // per hour: escaped latencies as id<<32 | latency
+	bt: Vec<AU>,
 	nx: [AU; 2],                  // next hour, next input chunk
 	out: Mutex<(usize, usize, [usize; H])>, // next hour to place, its offset, formatted lengths (MAX: not yet)
 }
@@ -282,8 +278,8 @@ unsafe fn work(t: usize, c: &Cx) {
 		pass(w.as_ptr(), x, (a + CS).min(len) - o, l, c);
 	}
 	for &(p, e) in l.iter() {
-		if p < e {
-			*c.rec.add(p as usize) = FILL;
+		for k in p..e {
+			*c.rec.add(k as usize) = FILL;
 		}
 	}
 	c.bar.wait();
@@ -295,14 +291,20 @@ unsafe fn work(t: usize, c: &Cx) {
 	let mut od: Vec<usize> = (0..tb.nid.load(Relaxed)).collect();
 	od.sort_unstable_by(|&p, &q| nm(p).cmp(nm(q)));
 	// per hour: count, scatter by endpoint rank, release the records, exact nearest-rank percentiles, format, write
+	// hours in index order, but the biggest first within each run of 12 (load swings 5x over a day): a shorter tail
+	let mut ord: Vec<usize> = (0..H).collect();
+	for b in ord.chunks_mut(12) {
+		b.sort_by_key(|&h| std::cmp::Reverse(c.top[h].load(Relaxed)));
+	}
 	let (mut cnt, mut off) = (vec![0u64; NE], vec![0u32; NE]); // cnt: count | errors<<32
 	loop {
-		let h = c.nx[0].fetch_add(1, Relaxed);
-		if h >= H {
+		let i = c.nx[0].fetch_add(1, Relaxed);
+		if i >= H {
 			break;
 		}
+		let h = ord[i];
 		cnt.fill(0);
-		each(c, h, |r, _| {
+		each(c, h, |&r| {
 			*cnt.get_unchecked_mut((r >> 21) as usize) += 1 | ((r >> 20 & 1) as u64) << 32;
 		});
 		let mut tot = 0;
@@ -310,12 +312,18 @@ unsafe fn work(t: usize, c: &Cx) {
 			off[id] = tot;
 			tot += cnt[id] as u32;
 		}
-		let v = std::slice::from_raw_parts_mut(c.val.add(t * c.cap), tot as usize);
-		each(c, h, |r, x| {
+		let v = std::slice::from_raw_parts_mut(c.val.add(t * c.cap), c.cap);
+		off[NE - 1] = tot; // block tails land after the groups
+		each(c, h, |&r| {
 			let k = off.get_unchecked_mut((r >> 21) as usize);
-			*v.get_unchecked_mut(*k as usize) = x;
-			*k += 1;
+			*v.get_unchecked_mut(*k as usize) = r & ESC;
+			*k += (r & ESC != ESC) as u32; // an escaped latency is placed from the side list
 		});
+		for &e in std::slice::from_raw_parts(c.big.add(h * c.cap), c.bt[h].load(Relaxed)) {
+			let k = off.get_unchecked_mut((e >> 32) as usize);
+			*v.get_unchecked_mut(*k as usize) = e as u32;
+			*k += 1;
+		}
 		free(c.rec.add(h * c.cap) as _, c.top[h].load(Relaxed) * 4); // the hour's records are done
 		let ab = h + 18;
 		let mut hs = *b"2026-10-30T00:00:00Z ";
@@ -401,6 +409,8 @@ fn main() {
 		txt: arena(H * OC),
 		cap,
 		top: (0..H).map(|_| AU::new(0)).collect(),
+		big: arena(H * cap * 8) as _,
+		bt: (0..H).map(|_| AU::new(0)).collect(),
 		nx: [AU::new(0), AU::new(0)],
 		out: Mutex::new((0, 0, [usize::MAX; H])),
 	};
