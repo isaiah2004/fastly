@@ -274,6 +274,60 @@ fn prefix(c: &mut [u32], nt: usize) {
     });
 }
 
+/// Per-thread edge buckets: each bucket is a chain of BLK-entry blocks cut from a
+/// few big slabs, so thousands of buckets cost a handful of allocations.
+const BLK: usize = 512;
+struct Buckets {
+    slabs: Vec<Vec<u64>>,
+    used: usize,
+    full: Vec<Vec<*const u64>>,
+    cur: Vec<(*mut u64, usize)>,
+}
+unsafe impl Send for Buckets {}
+unsafe impl Sync for Buckets {}
+impl Buckets {
+    fn new(k: usize, expect: usize) -> Buckets {
+        let mut b = Buckets { slabs: vec![Vec::with_capacity(expect + (k + 1) * BLK)], used: 0, full: vec![Vec::new(); k], cur: Vec::with_capacity(k) };
+        for _ in 0..k {
+            let p = b.block();
+            b.cur.push((p, 0));
+        }
+        b
+    }
+    fn block(&mut self) -> *mut u64 {
+        if self.used + BLK > self.slabs.last().unwrap().capacity() {
+            self.slabs.push(Vec::with_capacity(64 * BLK));
+            self.used = 0;
+        }
+        self.used += BLK;
+        unsafe { self.slabs.last_mut().unwrap().as_mut_ptr().add(self.used - BLK) }
+    }
+    #[inline(always)]
+    fn push(&mut self, j: usize, x: u64) {
+        let c = unsafe { self.cur.get_unchecked_mut(j) };
+        if c.1 == BLK {
+            let p = c.0;
+            self.full[j].push(p);
+            let q = self.block();
+            self.cur[j] = (q, 0);
+        }
+        let c = unsafe { self.cur.get_unchecked_mut(j) };
+        unsafe { *c.0.add(c.1) = x };
+        c.1 += 1;
+    }
+    fn each(&self, j: usize, mut f: impl FnMut(u64)) {
+        for &p in &self.full[j] {
+            for &x in unsafe { std::slice::from_raw_parts(p, BLK) } {
+                f(x);
+            }
+        }
+        let (p, l) = self.cur[j];
+        for &x in unsafe { std::slice::from_raw_parts(p, l) } {
+            f(x);
+        }
+    }
+}
+
 /// Rows of one thread, in the new order (heads still old ids).
 struct Rows {
     len: usize,
@@ -582,7 +636,7 @@ fn main() {
     let tm = std::env::var("DT_TIME").is_ok();
     let lap = |what: &str| {
         if tm {
-            eprintln!("{what}: {:?}", t0.elapsed())
+            eprintln!("{what}: {:?} {}", t0.elapsed(), std::fs::read_to_string("/proc/self/status").unwrap_or_default().lines().filter(|l| l.starts_with("VmHWM") || l.starts_with("VmRSS")).collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" "))
         }
     };
     let nt = std::thread::available_parallelism().map_or(12, |x| x.get()).min(32);
@@ -600,13 +654,21 @@ fn main() {
     let los: Vec<usize> = (0..=nt).map(|t| (((t as u64) << 32).div_ceil(mul) as usize).min(n)).collect();
     let lo = |t: usize| los[t];
     let ch = chunks(gb, p, nt);
-    // parts[p * nt + t]: edges parsed by thread p whose tail thread t owns, packed as
-    // (tail - lo(t)) << (16 + nb) | head << 16 | weight; weights >= 0xFFFF go to `huge`
+    // g0 is built from buckets of ns = nt * SUB row slots (thread t handles slots
+    // t * SUB .. (t + 1) * SUB one at a time, so its scattered writes stay in cache).
+    // parts[p], bucket j: edges parsed by thread p whose tail is in slot j, packed as
+    // (tail - slo(j)) << (16 + nb) | head << 16 | weight; weights >= 0xFFFF go to `huge`
+    const SUB: usize = 8;
+    let ns = nt * SUB;
+    let smul = ((ns as u64) << 32) / n as u64;
+    let sown = |x: u32| ((x as u64 * smul) >> 32) as usize;
+    let slos: Vec<usize> = (0..=ns).map(|j| (((j as u64) << 32).div_ceil(smul) as usize).min(n)).collect();
+    let slo = |j: usize| slos[j];
     let nb = (usize::BITS - n.leading_zeros()).max(1);
     let (vs, vm) = (16 + nb, (1u64 << nb) - 1);
     let res = par(nt, |t| {
         let (a, b) = ch[t];
-        let mut bk: Vec<Vec<u64>> = (0..nt).map(|_| Vec::with_capacity((b - a) / 18 / nt * 11 / 10 + 64)).collect();
+        let mut bk = Buckets::new(ns, (b - a) / 18 * 21 / 20);
         let mut huge = Vec::new();
         let mut i = a;
         while i < b {
@@ -614,8 +676,8 @@ fn main() {
             i = j;
             if u == v {
             } else if w < 0xFFFF {
-                let o = own(u);
-                bk[o].push(((u as usize - lo(o)) as u64) << vs | (v as u64) << 16 | w as u64);
+                let o = sown(u);
+                bk.push(o, ((u as usize - slo(o)) as u64) << vs | (v as u64) << 16 | w as u64);
             } else {
                 huge.push([u, v, w]);
             }
@@ -623,20 +685,20 @@ fn main() {
         (bk, huge)
     });
     let huge: Vec<[u32; 3]> = res.iter().flat_map(|r| r.1.iter().copied()).collect();
-    let parts: Vec<Vec<u64>> = res.into_iter().flat_map(|r| r.0).collect();
+    let parts: Vec<Buckets> = res.into_iter().map(|r| r.0).collect();
     lap("parse");
-    // the edges thread t owns: (tail, head, weight)
-    let (pr, hr) = (&parts, &huge);
-    let mine = move |t: usize| {
-        let pk = (0..nt).flat_map(move |p| pr[p * nt + t].iter().map(move |&x| ((x >> vs) as usize + lo(t), (x >> 16 & vm) as u32, (x & 0xFFFF) as u32)));
-        pk.chain(hr.iter().filter(move |e| own(e[0]) == t).map(|e| (e[0] as usize, e[1], e[2])))
-    };
     let mut deg = vec![0u32; n + 1];
     let dp = P(deg.as_mut_ptr());
     par(nt, |t| {
         let dp = dp;
-        for (u, _, _) in mine(t) {
-            unsafe { *dp.0.add(u) += 1 };
+        for j in t * SUB..(t + 1) * SUB {
+            let d = unsafe { dp.0.add(slo(j)) };
+            for p in &parts {
+                p.each(j, |x| unsafe { *d.add((x >> vs) as usize) += 1 });
+            }
+        }
+        for e in huge.iter().filter(|e| sown(e[0]) / SUB == t) {
+            unsafe { *dp.0.add(e[0] as usize) += 1 };
         }
     });
     let mut off0 = deg;
@@ -647,17 +709,29 @@ fn main() {
     let mut big: Vec<(u32, u32)> = par(nt, |t| {
         let (vp, wp) = (vp, wp);
         let mut big = Vec::new();
-        let mut cur = off0[lo(t)..lo(t + 1)].to_vec();
-        for (u, v, w) in mine(t) {
-            let k = &mut cur[u - lo(t)];
-            unsafe {
-                *vp.0.add(*k as usize) = v;
-                *wp.0.add(*k as usize) = w.min(0xFFFF) as u16;
+        let mut cur = Vec::new();
+        for j in t * SUB..(t + 1) * SUB {
+            cur.clear();
+            cur.extend_from_slice(&off0[slo(j)..slo(j + 1)]);
+            for p in &parts {
+                p.each(j, |x| {
+                    let k = unsafe { cur.get_unchecked_mut((x >> vs) as usize) };
+                    unsafe {
+                        *vp.0.add(*k as usize) = (x >> 16 & vm) as u32;
+                        *wp.0.add(*k as usize) = x as u16;
+                    }
+                    *k += 1;
+                });
             }
-            if w >= 0xFFFF {
-                big.push((*k, w));
+            for e in huge.iter().filter(|e| sown(e[0]) == j) {
+                let k = &mut cur[e[0] as usize - slo(j)];
+                unsafe {
+                    *vp.0.add(*k as usize) = e[1];
+                    *wp.0.add(*k as usize) = 0xFFFF;
+                }
+                big.push((*k, e[2]));
+                *k += 1;
             }
-            *k += 1;
         }
         big
     })
