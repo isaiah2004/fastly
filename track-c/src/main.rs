@@ -78,34 +78,13 @@ fn cents(s: &[u8]) -> i64 {
 }
 
 // ---------- regions: parsed in parallel into table[id] = country index + 1 (0 = unmatched) ----------
-struct Reg<'a> {
-    rd: &'a [u8],
-    tbl: &'static [AtomicU8],
-    cidx: Vec<AtomicU8>,
-    codes: Vec<AtomicU32>,
-    n: AtomicUsize,
-    bad: AtomicBool,
-}
-fn reg_new(rd: &[u8]) -> Option<Reg<'_>> {
-    // ids are ascending (2.3), so the last line holds the largest
-    let body = rd.strip_suffix(b"\n")?;
-    let last = &body[body.iter().rposition(|&b| b == b'\n')? + 1..];
-    let max = Some(uint_sat(&last[..last.iter().position(|&b| b == b',')?]) as usize).filter(|&m| m < 1 << 28)?;
-    let tbl = unsafe { std::slice::from_raw_parts(zalloc(max + 1, false) as *const AtomicU8, max + 1) };
-    Some(Reg {
-        rd,
-        tbl,
-        cidx: (0..26 * 26 * 26).map(|_| AtomicU8::new(0)).collect(),
-        codes: (0..256).map(|_| AtomicU32::new(0)).collect(),
-        n: AtomicUsize::new(0),
-        bad: AtomicBool::new(false),
-    })
-}
-impl Reg<'_> {
+/// The regions file, table[id] (country index + 1, 0 = unmatched), country index of each code,
+/// codes by index, the number of codes, and whether a malformed line was seen.
+type Reg<'a> = (&'a [u8], &'static [AtomicU8], Vec<AtomicU8>, Vec<AtomicU32>, AtomicUsize, AtomicBool);
     /// Parse the lines that start in the ti-th of nt slices; any line not of the form
     /// `digits,ABC\n` sets `bad`.
-    fn part(&self, ti: usize, nt: usize) -> Option<()> {
-        let d = self.rd;
+fn part(rg: &Reg, ti: usize, nt: usize) -> Option<()> {
+        let (d, tbl, cidx, codes, nc, _) = rg;
         let h = d.iter().position(|&b| b == b'\n')? + 1;
         let w = d.len() - h;
         let (mut p, e) = (h + w * ti / nt, h + w * (ti + 1) / nt);
@@ -118,20 +97,19 @@ impl Reg<'_> {
                 (id, p) = (id * 10 + (d[p].wrapping_sub(b'0')) as usize, p + 1);
             }
             let c = d.get(p + 1..p + 5).filter(|c| c[..3].iter().all(u8::is_ascii_uppercase) && c[3] == b'\n');
-            let c = c.filter(|_| id < self.tbl.len() && d[p] == b',')?;
+            let c = c.filter(|_| id < tbl.len() && d[p] == b',')?;
             let k = ((c[0] - b'A') as usize * 26 + (c[1] - b'A') as usize) * 26 + (c[2] - b'A') as usize;
-            let mut v = self.cidx[k].load(Relaxed);
+            let mut v = cidx[k].load(Relaxed);
             if v == 0 {
-                let n = self.n.fetch_add(1, Relaxed);
+                let n = nc.fetch_add(1, Relaxed);
                 let code = u32::from_le_bytes([c[0], c[1], c[2], 0]);
-                self.codes.get(n).filter(|_| n < UNM)?.store(code, Relaxed);
-                v = self.cidx[k].compare_exchange(0, n as u8 + 1, Relaxed, Relaxed).map_or_else(|x| x, |_| n as u8 + 1);
+                codes.get(n).filter(|_| n < UNM)?.store(code, Relaxed);
+                v = cidx[k].compare_exchange(0, n as u8 + 1, Relaxed, Relaxed).map_or_else(|x| x, |_| n as u8 + 1);
             }
-            self.tbl[id].store(v, Relaxed);
+            tbl[id].store(v, Relaxed);
             p += 5;
         }
         Some(())
-    }
 }
 
 // ---------- name table: one 64-byte slot per distinct name ----------
@@ -163,13 +141,11 @@ fn mum(a: u64, b: u64) -> u64 {
 /// The 8 bytes at s[i..]; every caller checks i + 8 <= len first.
 #[inline(always)]
 fn rd8(s: &[u8], i: usize) -> u64 {
-    debug_assert!(i + 8 <= s.len());
     unsafe { (s.as_ptr().add(i) as *const u64).read_unaligned() }
 }
 /// d[i] where the caller has established i < d.len().
 #[inline(always)]
 fn at(d: &[u8], i: usize) -> u8 {
-    debug_assert!(i < d.len());
     unsafe { *d.get_unchecked(i) }
 }
 fn hash_long(s: &[u8]) -> u64 {
@@ -198,10 +174,6 @@ const HIGH: [u64; 9] = {
     t
 };
 #[inline(always)]
-fn home(m0: u64) -> usize {
-    (m0 >> 32) as usize & (NS - 1)
-}
-#[inline(always)]
 fn tag(m0: u64) -> u8 {
     (m0 >> 56) as u8 | 1
 }
@@ -229,17 +201,13 @@ impl<'a> Names<'a> {
         let h = mum(a ^ w[2], l as u64 ^ 0xA0761D6478BD642F);
         [h >> 32 << 32 | (l as u64) << 10 | 3, w[0], w[1], w[2]]
     }
-    #[inline(always)]
-    fn owner(&self, m0: u64) -> usize {
-        home(m0) * self.nt >> NB
-    }
     /// The first slot from m0's home on that is empty or carries its tag. The slots before it hold
     /// other names, and slots are never cleared, so a later probe may start there.
     #[inline(always)]
     fn guess(&self, m0: u64, o: &Own) -> usize {
-        let (tg, mut i) = (tag(m0), home(m0));
+        let (tg, mut i) = (tag(m0), (m0 >> 32) as usize & (NS - 1)); // the home slot
         while !matches!(self.tags[i].load(Relaxed), x if x == 0 || x == tg) {
-            i = if i + 1 == o.hi { o.lo } else { i + 1 };
+            i = if i + 1 == o.1 { o.0 } else { i + 1 };
         }
         i
     }
@@ -267,8 +235,8 @@ impl<'a> Names<'a> {
                 let sl = &self.t[i].0;
                 let t = self.tags[i].load(Relaxed);
                 if t == 0 {
-                    o.n += 1;
-                    if o.n > (o.hi - o.lo) / 8 * 7 {
+                    o.2 += 1;
+                    if o.2 > (o.1 - o.0) / 8 * 7 {
                         return self.overflow.store(true, Relaxed);
                     }
                     (1..4).for_each(|k| sl[k].store(m[k], Relaxed));
@@ -283,24 +251,19 @@ impl<'a> Names<'a> {
                     break;
                 }
                 i += 1;
-                if i == o.hi {
-                    i = o.lo;
+                if i == o.1 {
+                    i = o.0;
                 }
             }
             let (wd, b) = (&self.t[i].0[4 + g / 64], g % 64);
             let w = wd.load(Relaxed);
-            o.dist[g] += (!w >> b) as u32 & 1; // a new (name, country) pair
+            o.3[g] += (!w >> b) as u32 & 1; // a new (name, country) pair
             wd.store(w | 1 << b, Relaxed);
         }
     }
 }
 /// An owner's slot range [lo, hi), how many of its slots are used, and its distinct names per group.
-struct Own {
-    lo: usize,
-    hi: usize,
-    n: usize,
-    dist: [u32; 256],
-}
+struct Own(usize, usize, usize, [u32; 256]);
 
 // ---------- SIMD block classification ----------
 /// Bit masks of '"', ',' and LF in the 64 bytes at p.
@@ -315,12 +278,6 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     };
     (m(b'"'), m(b','), m(b'\n'))
 }
-/// Bit i set iff an odd number of bits 0..=i of x are set (carry-less multiply by all ones).
-#[inline(always)]
-fn prefix_xor(x: u64) -> u64 {
-    let c = unsafe { _mm_clmulepi64_si128::<0>(_mm_set_epi64x(0, x as i64), _mm_set1_epi8(-1)) };
-    unsafe { _mm_cvtsi128_si64(c) as u64 }
-}
 #[inline(always)]
 fn low(n: usize) -> u64 {
     if n >= 64 { !0 } else { (1u64 << n) - 1 }
@@ -328,54 +285,33 @@ fn low(n: usize) -> u64 {
 
 const STAGE: usize = 128;
 const PD: usize = 1024; // stream prefetch distance
-/// A parsed record, staged (while its region entry is prefetched) until STAGE of them are aggregated.
+/// A parsed record (id, cents, name offset and raw length, name and note bytes, region id), staged
+/// (while its region entry is prefetched) until STAGE of them are aggregated.
 #[derive(Clone, Copy, Default)]
-struct Rec {
-    id: u64,
-    c: i64,
-    ko: usize,
-    kl: u32,
-    nb: u32,
-    tb: u32,
-    reg: u32,
-}
-struct Stage {
-    r: [Rec; STAGE],
-    n: usize,
-}
+struct Rec(u64, i64, usize, u32, u32, u32, u32);
+struct Stage([Rec; STAGE], usize);
 const BATCH: usize = 64;
-/// Messages for one owner; `from` is the producer, to which the owner hands the batch back for reuse.
-struct Batch {
-    next: *mut Batch,
-    from: usize,
-    n: usize,
-    m: [Msg; BATCH],
-}
+/// Messages for one owner: (stack link, producer, count, messages). The owner hands it back to the
+/// producer for reuse.
+struct Batch(*mut Batch, usize, usize, [Msg; BATCH]);
 /// Lock-free stack of batches: many pushers, one taker that always takes everything (so no ABA).
 #[repr(align(128))]
 struct Stack(AtomicPtr<Batch>);
 impl Stack {
     fn push(&self, b: *mut Batch) {
-        let mut h = self.0.load(Relaxed);
-        loop {
-            unsafe { (*b).next = h };
-            match self.0.compare_exchange_weak(h, b, Release, Relaxed) {
-                Ok(_) => return,
-                Err(x) => h = x,
-            }
-        }
+        let _ = self.0.fetch_update(Release, Relaxed, |h| {
+            unsafe { (*b).0 = h };
+            Some(b)
+        });
     }
     fn take(&self) -> *mut Batch {
         if self.0.load(Relaxed).is_null() { null_mut() } else { self.0.swap(null_mut(), Acquire) }
     }
 }
-/// A slot range with its fill count. Whoever holds `lock` may write the range: normally its owner
+/// (lock, owner state). Whoever holds the lock may write the slot range: normally its owner
 /// thread, but a thread that waits for batches helps by applying another owner's backlog.
 #[repr(align(128))]
-struct Part {
-    lock: AtomicBool,
-    own: std::cell::UnsafeCell<Own>,
-}
+struct Part(AtomicBool, std::cell::UnsafeCell<Own>);
 unsafe impl Sync for Part {}
 struct Ctx<'a> {
     d: &'a [u8],
@@ -404,14 +340,14 @@ impl Ctx<'_> {
             let mut b = self.spare[st.me].take();
             while !b.is_null() {
                 st.free.push(b);
-                b = unsafe { (*b).next };
+                b = unsafe { (*b).0 };
             }
             if !st.free.is_empty() {
                 continue;
             }
             if st.nb < 4 * self.parts.len() {
                 st.nb += 1;
-                return Box::into_raw(Box::new(Batch { next: null_mut(), from: st.me, n: 0, m: [[0; 4]; BATCH] }));
+                return Box::into_raw(Box::new(Batch(null_mut(), st.me, 0, [[0; 4]; BATCH])));
             }
             if !self.help() {
                 std::thread::yield_now();
@@ -420,7 +356,7 @@ impl Ctx<'_> {
     }
     /// Hand the open batch for owner o over and start a new one.
     fn post(&self, st: &mut St, o: usize) {
-        if unsafe { (*st.out[o]).n } > 0 {
+        if unsafe { (*st.out[o]).2 } > 0 {
             self.inbox[o].push(st.out[o]);
             st.out[o] = self.fresh(st);
         }
@@ -428,7 +364,7 @@ impl Ctx<'_> {
     /// Apply the batches waiting for owner o, unless another thread is doing so; true if any were.
     fn drain(&self, o: usize, wait: bool) -> bool {
         let pt = &self.parts[o];
-        while self.inbox[o].0.load(Relaxed).is_null() && !wait || pt.lock.swap(true, Acquire) {
+        while self.inbox[o].0.load(Relaxed).is_null() && !wait || pt.0.swap(true, Acquire) {
             if !wait {
                 return false;
             }
@@ -437,11 +373,11 @@ impl Ctx<'_> {
         let mut b = self.inbox[o].take();
         let any = !b.is_null();
         while let Some(x) = unsafe { b.as_mut() } {
-            self.names.apply(&x.m[..x.n], unsafe { &mut *pt.own.get() });
-            (x.n, b) = (0, x.next);
-            self.spare[x.from].push(x);
+            self.names.apply(&x.3[..x.2], unsafe { &mut *pt.1.get() });
+            (x.2, b) = (0, x.0);
+            self.spare[x.1].push(x);
         }
-        pt.lock.store(false, Release);
+        pt.0.store(false, Release);
         any
     }
     fn help(&self) -> bool {
@@ -451,22 +387,22 @@ impl Ctx<'_> {
 
 /// Aggregate the staged records and send their (name, country) messages to the slot owners.
 fn flush(cx: &Ctx, st: &mut St, sg: &mut Stage) {
-    for p in &sg.r[..sg.n] {
-        let r = p.reg as usize;
+    for p in &sg.0[..sg.1] {
+        let r = p.6 as usize;
         let g = cx.table.get(r).map_or(UNM as u8, |v| v.load(Relaxed).wrapping_sub(1));
-        st.agg[g as usize].add(&Agg(1, p.id, p.c, p.c, p.c, p.nb as u64, p.tb as u64));
-        let m = cx.names.msg(p.ko, p.kl as usize);
-        let o = cx.names.owner(m[0]); // < nt = out.len()
+        st.agg[g as usize].add(&Agg(1, p.0, p.1, p.1, p.1, p.4 as u64, p.5 as u64));
+        let m = cx.names.msg(p.2, p.3 as usize);
+        let o = ((m[0] >> 32) as usize & (NS - 1)) * cx.names.nt >> NB; // the home slot's owner, < out.len()
         let b = unsafe { &mut **st.out.get_unchecked(o) };
-        // b.n < BATCH: a full batch is posted at once
-        unsafe { *b.m.get_unchecked_mut(b.n) = [m[0] | (g as u64) << 2, m[1], m[2], m[3]] };
-        b.n += 1;
-        if b.n == BATCH {
+        // b.2 < BATCH: a full batch is posted at once
+        unsafe { *b.3.get_unchecked_mut(b.2) = [m[0] | (g as u64) << 2, m[1], m[2], m[3]] };
+        b.2 += 1;
+        if b.2 == BATCH {
             cx.post(st, o);
             cx.drain(st.me, false); // keeps the backlog small
         }
     }
-    sg.n = 0;
+    sg.1 = 0;
 }
 
 /// One record: start rs, field separators f[0..4], terminator (LF or EOF) f[4]; q and tq are the
@@ -500,9 +436,9 @@ fn record(cx: &Ctx, st: &mut St, sg: &mut Stage, rs: usize, f: &[usize; 5], q: u
     if kl >= LMAX {
         cx.names.overflow.store(true, Relaxed);
     }
-    sg.r[sg.n] = Rec { id, c, ko, kl: kl.min(LMAX) as u32, nb: nb as u32, tb: tb as u32, reg: reg as u32 };
-    sg.n += 1;
-    if sg.n == STAGE {
+    sg.0[sg.1] = Rec(id, c, ko, kl.min(LMAX) as u32, nb as u32, tb as u32, reg as u32);
+    sg.1 += 1;
+    if sg.1 == STAGE {
         flush(cx, st, sg);
     }
 }
@@ -539,7 +475,9 @@ impl Scan<'_> {
             self.qe = self.qb + (q & low(self.e - base)).count_ones() as u64;
         }
         self.cumq += q.count_ones() as u64;
-        let inq = prefix_xor(q) ^ self.carry;
+        // inside quotes: bit i set iff an odd number of quotes at 0..=i (carry-less multiply by all ones)
+        let x = unsafe { _mm_clmulepi64_si128::<0>(_mm_set_epi64x(0, q as i64), _mm_set1_epi8(-1)) };
+        let inq = unsafe { _mm_cvtsi128_si64(x) as u64 } ^ self.carry;
         (self.carry, self.q, self.s) = (((inq as i64) >> 63) as u64, q, (c | l) & !inq);
     }
     #[inline(always)]
@@ -568,7 +506,7 @@ fn parse_from(cx: &Ctx, st: &mut St, r0: usize, e: usize) -> u64 {
     let (d, len) = (cx.d, cx.d.len());
     let mut sc = Scan { d, e, base: r0, ..Default::default() };
     sc.block();
-    let mut sg = Stage { r: [Rec::default(); STAGE], n: 0 };
+    let mut sg = Stage([Rec::default(); STAGE], 0);
     let mut rs = r0;
     while let Some(f0) = sc.next() {
         let q0 = sc.quotes(f0);
@@ -603,7 +541,14 @@ fn parse_from(cx: &Ctx, st: &mut St, r0: usize, e: usize) -> u64 {
 type Rows = Vec<(Vec<u8>, Agg, u64)>;
 fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
     let len = d.len();
-    let rg = reg_new(rd).filter(|_| len < u32::MAX as usize)?; // staged lengths are 32-bit
+    // ids are ascending (2.3), so the last line holds the largest; staged lengths are 32-bit
+    let body = rd.strip_suffix(b"\n").filter(|_| len < u32::MAX as usize)?;
+    let last = &body[body.iter().rposition(|&b| b == b'\n')? + 1..];
+    let max = Some(uint_sat(&last[..last.iter().position(|&b| b == b',')?]) as usize).filter(|&m| m < 1 << 28)?;
+    let tbl = unsafe { std::slice::from_raw_parts(zalloc(max + 1, false) as *const AtomicU8, max + 1) };
+    let cidx = (0..26 * 26 * 26).map(|_| AtomicU8::new(0)).collect();
+    let codes = (0..256).map(|_| AtomicU32::new(0)).collect();
+    let rg: Reg = (rd, tbl, cidx, codes, AtomicUsize::new(0), AtomicBool::new(false));
     let t = unsafe { std::slice::from_raw_parts(zalloc(NS * 64, true) as *const Line, NS) };
     let tags = unsafe { std::slice::from_raw_parts(zalloc(NS, false) as *const AtomicU8, NS) };
     let names = Names { d, t, tags, nt, overflow: AtomicBool::new(false) };
@@ -611,9 +556,9 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
     let (inbox, spare) = (stk(), stk());
     // owner o has exactly the slots i with i * nt >> NB == o
     let range = |o: usize| ((o * NS).div_ceil(nt), ((o + 1) * NS).div_ceil(nt));
-    let own = |(lo, hi)| Part { lock: AtomicBool::new(false), own: Own { lo, hi, n: 0, dist: [0; 256] }.into() };
+    let own = |(lo, hi)| Part(AtomicBool::new(false), Own(lo, hi, 0, [0; 256]).into());
     let parts: Vec<Part> = (0..nt).map(|o| own(range(o))).collect();
-    let cx = Ctx { d, table: rg.tbl, names: &names, inbox: &inbox, spare: &spare, parts: &parts };
+    let cx = Ctx { d, table: rg.1, names: &names, inbox: &inbox, spare: &spare, parts: &parts };
     let auto = (nt * 32).min(len / 4096 + 1);
     let nch = if nch > 0 { nch } else { auto }.min(len.max(1));
     // per chunk: quotes in chunk << 2 | checked << 1 | implied parity
@@ -625,7 +570,7 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
     let work = |ti: usize| {
         // region pieces are claimed dynamically, so early threads do not wait for late spawns
         for i in std::iter::from_fn(|| Some(rnext.fetch_add(1, Relaxed))).take_while(|&i| i < RP) {
-            rg.bad.fetch_or(rg.part(i, RP).is_none(), Relaxed);
+            rg.5.fetch_or(part(&rg, i, RP).is_none(), Relaxed);
             rdone.fetch_add(1, Release);
         }
         while rdone.load(Acquire) < RP {
@@ -678,17 +623,17 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
     });
     let mut p = 0u64;
     for v in res.iter().map(|r| r.load(Relaxed)) {
-        if v & 2 != 0 && (v & 1) != p || names.overflow.load(Relaxed) || rg.bad.load(Relaxed) {
+        if v & 2 != 0 && (v & 1) != p || names.overflow.load(Relaxed) || rg.5.load(Relaxed) {
             return None;
         }
         p ^= (v >> 2) & 1;
     }
-    let code = |g: usize| rg.codes[g].load(Relaxed).to_le_bytes()[..3].to_vec();
+    let code = |g: usize| rg.3[g].load(Relaxed).to_le_bytes()[..3].to_vec();
     let mut rows: Rows = (0..256).map(|g| (code(g), AGG0, 0)).collect();
     rows[UNM].0 = b"_UNMATCHED".to_vec();
     for (g, row) in rows.iter_mut().enumerate() {
         all.iter().for_each(|a| row.1.add(&a[g]));
-        row.2 = parts.iter().map(|p| unsafe { &*p.own.get() }.dist[g] as u64).sum();
+        row.2 = parts.iter().map(|p| unsafe { &*p.1.get() }.3[g] as u64).sum();
     }
     Some(rows)
 }
@@ -703,7 +648,7 @@ fn slow(d: &[u8], rd: &[u8]) -> Rows {
         }
     }
     let mut groups: HashMap<&[u8], (Agg, HashSet<&[u8]>)> = HashMap::new();
-    let (len, mut p, mut n) = (d.len(), 0, 0);
+    let (len, mut p, mut header) = (d.len(), 0, true);
     while p < len {
         p += 3 * d[p..].starts_with(&[0xEF, 0xBB, 0xBF]) as usize;
         let mut fl: [(&[u8], usize); 5] = [(&[], 0); 5]; // (raw inner bytes, unescaped length)
@@ -728,9 +673,8 @@ fn slow(d: &[u8], rd: &[u8]) -> Rows {
         // p is one past the amount's terminator: step back over it unless it is CR LF or LF
         p += (p <= len && d[p - 1] == b'\r' && p < len && d[p] == b'\n') as usize;
         p -= (p <= len && !matches!(d[p - 1], b'\n' | b'\r')) as usize;
-        n += 1;
-        if n == 1 {
-            continue; // the header
+        if std::mem::take(&mut header) {
+            continue;
         }
         let key: &[u8] = reg.get(&uint_sat(fl[3].0)).map_or(b"_UNMATCHED", |k| k);
         let e = groups.entry(key).or_insert_with(|| (AGG0, HashSet::new()));
