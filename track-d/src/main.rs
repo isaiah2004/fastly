@@ -424,8 +424,8 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32], win: (P<u32>, P<(u32, 
             }
             list.push(s as u32);
             let mut q = 0;
-            while q < list.len() && list.len() < CAP {
-                // two-stage prefetch: rows of the node D1 ahead, tags of the heads of the node D2 ahead
+            // two-stage prefetch: rows of the node D1 ahead, tags of the heads of the node D2 ahead
+            let pre = |list: &[u32], q: usize| {
                 if let Some(&a) = list.get(q + D1) {
                     let k = g.off[a as usize] as usize;
                     pf(unsafe { g.e.as_ptr().add(k) });
@@ -437,6 +437,9 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32], win: (P<u32>, P<(u32, 
                         pf(&g.off[v as usize]);
                     }
                 }
+            };
+            while q < list.len() && list.len() < CAP {
+                pre(&list, q);
                 let row = &g.e[g.row(list[q] as usize)];
                 for &x in row {
                     let v = g.hd(x);
@@ -447,8 +450,9 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32], win: (P<u32>, P<(u32, 
                 copy(&mut r, t, done + q, list[q], row);
                 q += 1;
             }
-            // the rows of the nodes left in the queue when the region filled up
+            // the rows of the nodes left in the queue when the region filled up (~4% of nodes)
             for i in q..list.len() {
+                pre(&list, i);
                 copy(&mut r, t, done + i, list[i], &g.e[g.row(list[i] as usize)]);
             }
             done += list.len();
