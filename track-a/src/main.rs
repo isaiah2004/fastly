@@ -27,13 +27,15 @@ struct Loc {
 #[repr(align(64))]
 struct Ent([u8; 128]);
 struct Tab {
-	slot: Vec<AtomicU64>,
+	slot: Vec<Sl>,
 	ent: *mut Ent,
 	nid: AU,
 	gs: Vec<AtomicU32>, // id -> slot
-	hs: Vec<AtomicU64>, // slot -> full hash
 	dup: AtomicBool,    // two different endpoints share a full hash and length
 }
+
+#[repr(C, align(16))] // word and full hash share a cache line
+struct Sl(AtomicU64, AtomicU64);
 
 // endpoint id: probe from the hash; byte-compare when verifying (pass 1) or if hashes are not unique
 #[inline(always)]
@@ -42,20 +44,20 @@ unsafe fn find(tb: &Tab, e: *const u8, n: usize, hv: u64, verify: bool) -> usize
 	let mut s = hv as usize & (TS - 1);
 	loop {
 		let sl = tb.slot.get_unchecked(s);
-		let t = sl.load(Acquire);
-		if t >> 16 == tag >> 16 && tb.hs.get_unchecked(s).load(Relaxed) == hv {
+		let t = sl.0.load(Acquire);
+		if t >> 16 == tag >> 16 && sl.1.load(Relaxed) == hv {
 			if !verify || v::eq(e, n, (*tb.ent.add(s)).0.as_ptr()) {
 				return (t & 0xffff) as usize - 1;
 			}
 			tb.dup.store(true, Relaxed);
 		} else if t == 0 {
-			if sl.compare_exchange(0, 1, Acquire, Relaxed).is_ok() {
+			if sl.0.compare_exchange(0, 1, Acquire, Relaxed).is_ok() {
 				std::ptr::copy_nonoverlapping(e, (*tb.ent.add(s)).0.as_mut_ptr(), n);
 				let id = tb.nid.fetch_add(1, Relaxed);
 				assert!(id < NE);
 				tb.gs[id].store(s as u32, Relaxed);
-				tb.hs[s].store(hv, Relaxed);
-				sl.store(tag | (id as u64 + 1), Release);
+				sl.1.store(hv, Relaxed);
+				sl.0.store(tag | (id as u64 + 1), Release);
 				return id;
 			}
 			continue;
@@ -301,7 +303,7 @@ unsafe fn work(t: usize, c: &Cx) {
 		let e = tb.nid.load(Relaxed);
 		let nm = |g: usize| {
 			let s = tb.gs[g].load(Relaxed) as usize;
-			&(&(*tb.ent.add(s)).0)[..(tb.slot[s].load(Relaxed) >> 16 & 255) as usize]
+			&(&(*tb.ent.add(s)).0)[..(tb.slot[s].0.load(Relaxed) >> 16 & 255) as usize]
 		};
 		let o = c.ord.g();
 		*o = (0..e).collect();
@@ -449,11 +451,10 @@ fn main() {
 		locs: (0..nt).map(|_| s(Loc::default())).collect(),
 		bar: Barrier::new(nt),
 		tb: Tab {
-			slot: (0..TS).map(|_| AtomicU64::new(0)).collect(),
+			slot: (0..TS).map(|_| Sl(AtomicU64::new(0), AtomicU64::new(0))).collect(),
 			ent: unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(TS * 128, 64).unwrap()) as *mut Ent },
 			nid: AU::new(0),
 			gs: (0..NE).map(|_| AtomicU32::new(0)).collect(),
-			hs: (0..TS).map(|_| AtomicU64::new(0)).collect(),
 			dup: AtomicBool::new(false),
 		},
 		ord: s(vec![]),
