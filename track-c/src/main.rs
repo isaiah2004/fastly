@@ -433,9 +433,7 @@ fn record(cx: &Ctx, st: &mut St, sg: &mut Stage, rs: usize, f: &[usize; 5], q: u
     } else {
         cents(d.get(s..e).unwrap_or(&[]))
     };
-    if kl >= LMAX {
-        cx.names.overflow.store(true, Relaxed);
-    }
+    // kl >= LMAX is staged as LMAX, and msg() flags the overflow
     sg.0[sg.1] = Rec(id, c, ko, kl.min(LMAX) as u32, nb as u32, tb as u32, reg as u32);
     sg.1 += 1;
     if sg.1 == STAGE {
@@ -577,9 +575,7 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
         while rdone.load(Acquire) < RP {
             std::hint::spin_loop();
         }
-        if ti == 0 {
-            unsafe { madvise(rd.as_ptr() as *mut u8, rd.len(), 4) }; // the regions file is parsed
-        }
+        (ti == 0).then(|| unsafe { madvise(rd.as_ptr() as *mut u8, rd.len(), 4) }); // regions parsed
         let mut st = St { agg: Box::new([AGG0; 256]), me: ti, out: vec![], free: vec![], nb: 0 };
         st.out = (0..nt).map(|_| cx.fresh(&mut st)).collect();
         for i in std::iter::from_fn(|| Some(next.fetch_add(1, Relaxed))).take_while(|&i| i < nch) {
@@ -631,13 +627,10 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
         let hs: Vec<_> = (0..nt).map(|ti| spawn(ti).expect("spawn")).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let mut p = 0u64;
-    for v in res.iter().map(|r| r.load(Relaxed)) {
-        if v & 2 != 0 && (v & 1) != p || names.overflow.load(Relaxed) || rg.5.load(Relaxed) {
-            return None;
-        }
-        p ^= (v >> 2) & 1;
-    }
+    let bad = names.overflow.load(Relaxed) || rg.5.load(Relaxed);
+    let par = |p: u64, v: u64| (v & 2 == 0 || v & 1 == p).then_some(p ^ (v >> 2) & 1);
+    let mut vs = res.iter().map(|r| r.load(Relaxed));
+    vs.try_fold(0, par).filter(|_| !bad)?;
     let code = |g: usize| rg.3[g].load(Relaxed).to_le_bytes()[..3].to_vec();
     let mut rows: Rows = (0..256).map(|g| (code(g), AGG0, 0)).collect();
     rows[UNM].0 = b"_UNMATCHED".to_vec();
