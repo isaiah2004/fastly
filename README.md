@@ -1,96 +1,62 @@
-# Speed Demon 2026 starter
+# Team 3pi4: Speed Demon 2026
 
-A working entry for all four tracks of [Speed Demon 2026](https://speeddemon.dev). Each `track-*` folder holds the organisers' naive Python reference, packaged the way the live board builds and runs it. Use it to check your setup end to end, then replace the reference with your own code.
+This repo is our entry in all four tracks. Each track is one Rust file with only the standard library: zero dependencies, nothing vendored. Each `track-*` folder has the full write-up (README.md) and the step-by-step log with board run IDs (PERF.md).
 
-## Start in five steps
+Board numbers below are **as of commit fee1215**.
 
-1. **Use this template** (the green button on GitHub) to create your repo. It can stay private until code freeze.
-2. **Install the [Speed Demon Board app](https://github.com/apps/speed-demon-board)** on that repo. It gets read-only access to the repos you pick and nothing else.
-3. **Register your team** on the [submission form](https://tally.so/r/Ar7g9z), with the repo URL and the tracks you are entering.
-4. **Push to the `speed-demon` branch.** It is this template's default branch, so a plain `git push` does it. The board picks up each push, builds every `track-*` folder and runs it once on the full public dataset. Results appear on speeddemon.dev.
-5. **Make it fast.** Log every step in the track's `PERF.md`, with the board run ID that measured it. At code freeze (November 2, 15:00 UTC), make the repo public.
+| Track | Board run | T | M | K | Details |
+|---|---|---|---|---|---|
+| A: Ingest | run-c56b72a97a8f | 25.3 ms | 20.4 MB | 42.2 | [README](track-a/README.md) · [PERF](track-a/PERF.md) |
+| B: Index | run-0cb071d721ba | 171.7 ms | 37.9 MB | 27.1 | [README](track-b/README.md) · [PERF](track-b/PERF.md) |
+| C: Join | run-9206d49f43e1 | 40.1 ms | 13.3 MB | 26.9 | [README](track-c/README.md) · [PERF](track-c/PERF.md) |
+| D: Traverse | run-7213cfc0f5c2 | 151.4 ms | 71.3 MB | 22.6 | [README](track-d/README.md) · [PERF](track-d/PERF.md) |
 
-One repo per team holds all your tracks. Delete the folders of the tracks you are not entering. An unchanged folder is the reference itself, so the board reports it as unchanged and does not run it.
+## Track A: Ingest (request log to per-hour percentiles)
 
-## What is in a track folder
+- Single pass. Threads `pread` 64 KB chunks into an L2-sized buffer. Newline positions come from a branch-free bitmask walk, and the latency is parsed by an SSE routine with no branches.
+- Endpoints are interned in one lock-free open-addressing table that all threads share (8-byte slot words, always verified on the bytes), so there is no merge step.
+- Each line becomes a 4-byte record in per-hour regions of a reserved arena. Per hour: count, scatter by endpoint rank into an L2-sized array, then exact p50/p95/p99 with `select_nth_unstable` on shrinking upper parts.
+- Hours are formatted and `pwrite`n in parallel at their final offsets, and each region is released with `MADV_DONTNEED` when done. Peak memory is about 4 bytes per line.
 
-| File | What it is |
-|---|---|
-| `Dockerfile` | Builds the folder offline, from an allowlisted image pinned by digest |
-| `.speed-demon.toml` | Track, team, language, dependency count; set `team` |
-| `PERF.md` | Your optimisation log, worth 8% of your total |
-| `README.md` | Your approach, your dependencies, your next 24 hours |
-| `run.py` + module | The reference; replace it with your code |
+## Track B: Index (boolean and phrase queries over documents)
 
-## How your program runs
+- Queries are parsed first, and only their terms are ever indexed. A 1 MB sample picks dense bitmaps for frequent BOOL terms and sorted 16-bit posting lists for the rest.
+- Documents are processed in rounds of 65,536, so only one round's index is alive at a time and doc ids fit in 16 bits.
+- The AVX2 tokenizer turns 64-byte blocks into token boundary masks. Table slots are prefetched per document, and each 64-doc block's bitmap words build up in L1 and are written once.
+- Phrases are checked in place at their rarest term. BOOL queries are folded over lists and bitmaps: galloping AND/NOT, OR switching to a bitmap, popcounts for counts.
 
-- It reads its inputs from `/data`, which is read-only, and writes exactly one file to `/out`, then exits 0. The file is `summary.txt` for A, `results.txt` for B, `aggregates.txt` for C and `distances.txt` for D.
-- `TRACK` is set to `a`, `b`, `c` or `d`.
-- There is no network, at build time or at run time. Commit your dependencies to the repo (`cargo vendor`, `go mod vendor` and so on).
-- It runs as an unprivileged user on a read-only filesystem. `/tmp` is 1 GB of scratch space.
-- It gets 12 hardware threads (six P-cores, turbo off), 8 GB of memory with no swap, and 512 processes.
-- The live board stops a run at 3x the reference's time. Final scoring stops it at 10x.
-- Your output must match the reference's byte for byte (sha256) on every run.
+## Track C: Join (CSV records against regions, distinct names per country)
 
-## Check before you push
+- The CSV is parsed in parallel without a sequential pass. Each chunk guesses that it starts outside quotes, and the guesses are checked afterwards against the exact quote-parity prefix. A wrong guess reruns an exact sequential parser.
+- AVX2 masks for quotes, commas and newlines; a carry-less multiply (PCLMUL) gives the inside-quotes mask; SWAR number parsing; amounts in integer cents.
+- Distinct names live in one 64-byte line each. The table is split into hash ranges that only their owner thread touches; other threads send records over lock-free batch stacks.
+- Peak memory is about 12 MB: an 8 MB name table, a 1 MB region table, and the rest runtime.
 
-`check.py` builds a track offline and runs it with the board's Docker settings, then prints the output's sha256 and a rough time. You need Docker and Python 3.
+## Track D: Traverse (shortest paths on a road network)
 
-```
-python3 check.py a --data data/a
-```
+- Parallel AVX2 parse into per-slot buckets, then a first graph built slot by slot while the buckets are in cache.
+- Parallel BFS region growing renumbers the nodes for locality. Without it, the queries take 299 ms instead of 127 ms. The renumbering also lets 96% of edges fit in 4 bytes (16-bit id delta + 15-bit weight).
+- Bidirectional Dijkstra that expands the smaller heap: 2.8× fewer settled nodes than one-way search, and half as many as choosing the side by smaller key. 4-ary packed-key heap; paged u32 labels with u64 and wide-key fallbacks.
+- Queries are handed out from one atomic counter, longest |s - t| first, and all 12 threads finish within 3.4 ms of each other.
 
-To get data, generate it with the public generators. Seed 1 at `full` scale is the board's dataset; `sample` is 10% of it.
+## Shared engineering principles
 
-```
-git clone https://github.com/hackathon-raptors/speed-demon-2026
-python3.13 speed-demon-2026/generators/a_ingest.py --seed 1 --scale sample --out data/a
-```
+- **Std-only Rust, zero dependencies.** System calls (`mmap`, `madvise`, `mallopt`, `pwrite`) are declared through `extern "C"` under `cfg(target_os = "linux")`, with a portable `std::fs` fallback. D = 1 on every track.
+- **How each track reads its input.** It depends on the access pattern:
+  - `mmap` where many threads read the input in parallel, sometimes more than once (B, C, D; D adds `MAP_POPULATE`).
+  - `pread` into small L2-resident buffers where one streaming pass suffices (A); this avoids page-table work and keeps memory flat.
+  - D's big arrays come straight from 2 MiB-aligned `mmap` with `MADV_HUGEPAGE` and are unmapped on free, and C asks for huge pages for its name table.
+  - Tracks A, C and D set `M_ARENA_MAX=1`, a single glibc malloc arena, so per-thread heaps do not inflate M.
+- **AVX2 where it removes branches.** `target-cpu=x86-64-v3` (plus PCLMUL in C). Delimiter finding is a compare plus movemask, digits use SWAR, and masks are walked with `tzcnt`. Every SIMD path has a scalar fallback for lines it cannot handle.
+- **Measuring on a noisy host.** Local work ran on a shared laptop with mixed P/E cores.
+  - Every change was judged by interleaved A/B runs and the minimum over many runs, and changes inside the noise were dropped.
+  - Deterministic counters (settled nodes, probes, records) were used wherever time was too noisy.
+  - Board run IDs are the ground truth. Where they disagree with local numbers, the PERF logs say so (for example, track D's steps 11–13).
+- **Holdout safety.** Every program is exact for any input the spec allows, not just seed 1:
+  - Fallbacks: C's speculative parse is re-verified and can rerun sequentially; D's u32 labels rerun as u64, then as a wide-key Dijkstra; A writes rare large latencies as escape records.
+  - Interning and joins always compare bytes, never hashes alone.
+  - Every output was hash-checked on the tiny, sample and full datasets plus extra seeds, and with `check.py` in Docker.
 
-No Python 3.13? Run the generator in the same image the reference uses:
+## Layout
 
-```
-docker run --rm -v "$PWD:/w" -w /w python:3.13-slim python3 speed-demon-2026/generators/a_ingest.py --seed 1 --scale sample --out data/a
-```
-
-Run the check once on the unchanged folder. The sha256 it prints is the correct answer for that data. After every change, pass it back, so the check fails on a wrong answer:
-
-```
-python3 check.py a --data data/a --expected <sha256>
-```
-
-The full datasets and their expected hashes are also published at kickoff, October 30, 15:00 UTC, linked from speeddemon.dev.
-
-On Colima, keep the repo and the data under your home folder, or Docker cannot mount them.
-
-## Your own language
-
-Replace the folder's contents with your code and a Dockerfile that builds it offline. A two-stage build keeps the image small. For Rust with no crates:
-
-```
-FROM rust:1-slim-trixie@sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb AS build
-WORKDIR /src
-COPY . .
-RUN cargo build --release --offline
-
-FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
-COPY --from=build /src/target/release/solution /app/solution
-ENTRYPOINT ["/app/solution"]
-```
-
-Here `solution` is the package name in your `Cargo.toml`. Every allowlisted image and its digest is in [allowlist.json](https://speeddemon.dev/allowlist.json). Each direct runtime dependency costs a little, so count them in `.speed-demon.toml`.
-
-## What the board refuses before it builds
-
-- A `FROM` that is not in the allowlist, or not pinned by digest.
-- `ADD` of a URL or a git repo, and `COPY --from` an image (an earlier stage is fine).
-- A `# syntax=` line; cache, secret or ssh mounts; `RUN --network`, `--security` or `--device`; `ONBUILD`.
-- A build over 10 minutes, or an image over 2 GB.
-
-## Scoring, briefly
-
-Faster than the reference earns points. Using less memory helps, up to a cap. Code beyond the reference's size, and every dependency, cost a little. Each track folder is built and measured on its own: your other tracks never count toward it, and code shared between tracks is copied into each folder that uses it and counts in each. A run that fails correctness, the timeout or the sandbox scores nothing. The full formula and the judging criteria are on speeddemon.dev.
-
-## Licence
-
-The reference code is copyright Hackathon Raptors CIC, under the MIT licence in `LICENSE`. Your repo has to be public under an OSI-approved licence at code freeze; keeping MIT is the simplest way.
+`track-a` … `track-d` each have their own Dockerfile (the organisers' pinned two-stage Rust build), `.speed-demon.toml`, README and PERF log. `check.py` is the organisers' local checker, unchanged.
