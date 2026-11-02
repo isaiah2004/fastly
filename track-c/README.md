@@ -38,7 +38,9 @@ Rust, std only, one file (`src/main.rs`), for Linux on x86-64 with AVX2, BMI2 an
 - **Memory.** ~11 MB peak anonymous memory locally: 8 MB name table (huge pages requested), 1 MB region
   table (huge pages refused, so with THP `always` it is never backed by a whole 2 MiB page), message
   batches, the rest runtime. One glibc malloc arena (`mallopt`); 256 KiB thread stacks.
-  File pages are released early (`MADV_DONTNEED`): `regions.csv` once parsed, each input chunk once done.
+  File pages are released early (`MADV_DONTNEED`): `regions.csv` once parsed, each input chunk once done
+  (its whole pages), and once every chunk up to k is done, all of chunk k's pages, including the pages at
+  chunk boundaries and any mapped again by a late read.
 - **Fallbacks.** More than ~114k distinct names, more than 255 countries, or an unexpected `regions.csv`
   shape also fall back to the exact sequential path. `--slow` forces it (used for cross-checking).
 

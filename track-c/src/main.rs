@@ -566,7 +566,8 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
     let hdr = d.iter().position(|&b| b == b'\n').map_or(len, |x| x + 1);
     const RP: usize = 64;
     let z = || AtomicUsize::new(0);
-    let (next, done, rnext, rdone) = (z(), z(), z(), z());
+    let (next, done, rnext, rdone, low) = (z(), z(), z(), z(), z());
+    let fin: Vec<AtomicBool> = (0..nch).map(|_| AtomicBool::new(false)).collect();
     let work = |ti: usize| {
         // region pieces are claimed dynamically, so early threads do not wait for late spawns
         for i in std::iter::from_fn(|| Some(rnext.fetch_add(1, Relaxed))).take_while(|&i| i < RP) {
@@ -601,6 +602,15 @@ fn fast(d: &[u8], rd: &[u8], nt: usize, nch: usize) -> Option<Rows> {
             let (a, b) = ((s + 4095) & !4095, e & !4095);
             let pa = d.as_ptr().wrapping_add(a) as *mut u8;
             unsafe { madvise(pa, b.saturating_sub(a), 4) };
+            // chunks 0..k all done: drop chunk k's pages including its boundary pages, which the
+            // per-chunk drop leaves, and pages a late read mapped again
+            fin[i].store(true, Release);
+            let mut k = low.load(Acquire);
+            while k < nch && fin[k].load(Acquire) && low.compare_exchange(k, k + 1, AcqRel, Acquire).is_ok() {
+                let (a, b) = (k * len / nch & !4095, (k + 1) * len / nch & !4095);
+                unsafe { madvise(d.as_ptr().wrapping_add(a) as *mut u8, b - a, 4) };
+                k += 1;
+            }
             cx.drain(ti, false);
         }
         (0..nt).for_each(|o| cx.post(&mut st, o));
