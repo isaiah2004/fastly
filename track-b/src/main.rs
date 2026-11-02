@@ -191,6 +191,48 @@ unsafe fn mask64(p: *const u8) -> (u64, u64) {
     (m, n)
 }
 
+// Tokens of the line that starts at p: pos gets the start and end of every maximal [A-Za-z0-9] run,
+// relative to p. Returns the length of the line with its newline.
+#[inline(always)]
+fn line_tokens(buf: &[u8], p: usize, pos: &mut Vec<u32>) -> usize {
+    pos.clear();
+    let (mut q, mut carry) = (p, 0u64);
+    loop {
+        pos.reserve(72);
+        let (mut m, nl) = if q + 64 <= buf.len() {
+            unsafe { mask64(buf.as_ptr().add(q)) }
+        } else {
+            let mut t = [b'\n'; 64];
+            t[..buf.len() - q].copy_from_slice(&buf[q..]);
+            unsafe { mask64(t.as_ptr()) }
+        };
+        let lim = nl.trailing_zeros();
+        if lim < 64 {
+            m &= (1u64 << lim) - 1;
+        }
+        // bits of t: token starts and ends (a run cut at the newline ends there)
+        let mut t = m ^ (m << 1 | carry);
+        carry = m >> 63;
+        let (off, cnt, n0) = ((q - p) as u32, t.count_ones() as usize, pos.len());
+        unsafe {
+            let o = pos.as_mut_ptr().add(n0);
+            let mut k = 0;
+            while k < cnt {
+                for u in 0..8 {
+                    *o.add(k + u) = off + t.trailing_zeros();
+                    t &= t.wrapping_sub(1);
+                }
+                k += 8;
+            }
+            pos.set_len(n0 + cnt);
+        }
+        if lim < 64 {
+            return q - p + lim as usize + 1;
+        }
+        q += 64;
+    }
+}
+
 // Calls f(start, end, first) for every maximal [A-Za-z0-9] run in buf[a..b], where first says the
 // run starts a line (the doc id). buf[a] starts a line, buf[b-1] is a newline.
 #[inline(always)]
@@ -277,6 +319,8 @@ fn parse_u32(b: &[u8]) -> u32 {
 
 struct Ctx<'a> {
     dummy: u32,
+    lo: usize, // list terms are lo..lo + nl
+    nl: usize,
     buf: &'a [u8],
     tab: Tab,
     bm: Ptr<u64>,
@@ -290,8 +334,8 @@ struct Ctx<'a> {
 struct Ptr<T>(*mut T);
 unsafe impl<T> Sync for Ptr<T> {}
 
-// One sub-chunk (at most 32768 docs, one 65536-doc partition): postings of the list terms as
-// the low 16 bits of the doc ids, term t at post[offs[t]..offs[t + 1]]; phrase matches.
+// One sub-chunk (at most 16384 docs, one 65536-doc partition): postings of the list terms as
+// the low 16 bits of the doc ids, list term lo + t at post[offs[t]..offs[t + 1]]; phrase matches.
 struct WOut {
     part: u32,
     offs: Vec<u32>,
@@ -308,7 +352,7 @@ fn finish(c: &Ctx, doc: u32, ids: &[u32], kp: &[u32], pm: &mut Vec<(u32, u32)>, 
             }
             let st = (p - off) as usize;
             let terms = &c.p_terms[c.p_off[ph as usize] as usize..c.p_off[ph as usize + 1] as usize];
-            if st + terms.len() <= ids.len() && &ids[st..st + terms.len()] == terms {
+            if st + terms.len() <= ids.len() && terms.iter().zip(&ids[st..]).all(|(a, b)| a == b) {
                 lastpm[ph as usize] = doc;
                 pm.push((ph, doc));
             }
@@ -344,15 +388,14 @@ fn decode(st: &[u8], mut f: impl FnMut(u16, usize)) {
 
 #[derive(Default)]
 struct W {
-    lc: Vec<[u16; 2]>, // per term: last doc seen (relative to base; chunks hold at most 32768 docs), docs
+    lc: Vec<[u16; 2]>, // per list term: last doc seen (relative to base; chunks hold at most 16384 docs), docs
     base: u32,
     lastpm: Vec<u32>,
     stream: Vec<u8>, // per doc with list terms: 0, doc (4 bytes LE), then LEB128(term + 1) each
     pm: Vec<(u32, u32)>,
     ids: Vec<u32>,
     kp: Vec<u32>,
-    bms: Vec<u32>,
-    lst: Vec<u32>,
+    pos: Vec<u32>,
     ks: Vec<(u64, u32, u32)>, // per token: (bytes 0..8, bytes 8..12, h12), or (term lookup result, MAX, 0) when longer
 }
 
@@ -360,75 +403,64 @@ impl W {
     // All tokens of one document are in ks: hash and prefetch first, then look up and index.
     fn doc(&mut self, c: &Ctx, doc: u32) {
         let n = self.ks.len();
-        for v in [&mut self.ids, &mut self.kp, &mut self.bms, &mut self.lst] {
-            v.clear();
-            v.reserve(n);
-        }
+        self.ids.clear();
+        self.ids.reserve(n);
+        self.kp.clear();
+        self.kp.reserve(n);
+        self.stream.reserve(n * 3 + 9);
         for &(_, _, h) in &self.ks {
             c.tab.prefetch32(h);
         }
-        // Look up every token and sort the hits by kind with branch-free appends (a miss is the
-        // dummy term nt, which has no flags).
-        let (mut nb, mut nl, mut kl) = (0, 0, 0);
+        // One pass: look up, set the bitmap bit of bitmap terms, record the first occurrence of a
+        // list term in the stream, note phrase key positions. Term-major bitmaps: chunks start at
+        // doc ids that are multiples of 64, so each word has one writer.
+        let col = unsafe { c.bm.0.add((doc >> 6) as usize) } as usize;
+        let bit = 1u64 << (doc & 63);
+        let rel = (doc - self.base) as u16;
+        let (l0, st, lc) = (self.stream.len(), self.stream.as_mut_ptr(), unsafe { self.lc.as_mut_ptr().sub(c.lo) });
+        unsafe { (st.add(l0) as *mut [u8; 5]).write_unaligned([0, doc as u8, (doc >> 8) as u8, (doc >> 16) as u8, (doc >> 24) as u8]) };
+        let (mut sl, mut kl) = (l0 + 5, 0);
         for (pos, &(k0, k1, h)) in self.ks.iter().enumerate() {
             let r = if k1 == u32::MAX { k0 as u32 } else { c.tab.get12(k0, k1, h) };
             let r = if r == MISS { c.dummy } else { r };
-            let ti = r & 0xFF_FFFF;
+            let ti = (r & 0xFF_FFFF) as usize;
             let fl = r >> 24; // 1 list, 2 bitmap (bitmap index = id), 4 phrase key
             unsafe {
-                *self.ids.as_mut_ptr().add(pos) = ti;
-                *self.bms.as_mut_ptr().add(nb) = ti;
-                nb += ((fl >> 1) & 1) as usize;
-                *self.lst.as_mut_ptr().add(nl) = ti;
-                nl += (fl & 1) as usize;
+                *self.ids.as_mut_ptr().add(pos) = ti as u32;
+                if fl & 2 != 0 {
+                    *((col + ti * c.w * 8) as *mut u64) |= bit;
+                }
+                if fl & 1 != 0 {
+                    let e = &mut *lc.add(ti);
+                    if e[0] != rel {
+                        e[0] = rel;
+                        e[1] += 1;
+                        let v = (ti - c.lo) as u32 + 1;
+                        let (m1, m2) = ((v >= 1 << 7) as u32, (v >= 1 << 14) as u32);
+                        (st.add(sl) as *mut u32).write_unaligned((v & 0x7F | m1 << 7) | ((v >> 7) & 0x7F | m2 << 7) << 8 | (v >> 14) << 16);
+                        sl += (1 + m1 + m2) as usize;
+                    }
+                }
                 *self.kp.as_mut_ptr().add(kl) = pos as u32;
                 kl += ((fl >> 2) & 1) as usize;
             }
         }
         unsafe {
             self.ids.set_len(n);
-            self.bms.set_len(nb);
-            self.lst.set_len(nl);
             self.kp.set_len(kl);
+            self.stream.set_len(if sl == l0 + 5 { l0 } else { sl });
         }
         self.ks.clear();
-        // term-major bitmaps; chunks start at doc ids that are multiples of 64, so each word has
-        // one writer, and 64 docs in a row reuse the same cache lines
-        let col = unsafe { c.bm.0.add((doc >> 6) as usize) };
-        for &t in &self.bms {
-            unsafe { *col.add(t as usize * c.w) |= 1u64 << (doc & 63) };
-        }
-        // list terms: first occurrence in the doc goes to the stream
-        if nl > 0 {
-            self.stream.reserve(nl * 3 + 9);
-            let (l0, st) = (self.stream.len(), self.stream.as_mut_ptr());
-            unsafe { (st.add(l0) as *mut [u8; 5]).write_unaligned([0, doc as u8, (doc >> 8) as u8, (doc >> 16) as u8, (doc >> 24) as u8]) };
-            let mut sl = l0 + 5;
-            let rel = (doc - self.base) as u16;
-            for &t in &self.lst {
-                unsafe {
-                    let e = self.lc.get_unchecked_mut(t as usize);
-                    let new = (e[0] != rel) as u32;
-                    e[0] = rel;
-                    e[1] += new as u16;
-                    let v = t + 1;
-                    let (m1, m2) = ((v >= 1 << 7) as u32, (v >= 1 << 14) as u32);
-                    (st.add(sl) as *mut u32).write_unaligned((v & 0x7F | m1 << 7) | ((v >> 7) & 0x7F | m2 << 7) << 8 | (v >> 14) << 16);
-                    sl += (new * (1 + m1 + m2)) as usize;
-                }
-            }
-            unsafe { self.stream.set_len(sl) };
-        }
         finish(c, doc, &self.ids, &self.kp, &mut self.pm, &mut self.lastpm);
     }
 }
 
-// Index buf[a..b); a new output starts at each cut (every 32768 docs) so every output lies in one
-// 65536-doc partition and holds at most 32768 docs.
+// Index buf[a..b); a new output starts at each cut (every 16384 docs) so every output lies in one
+// 65536-doc partition and holds at most 16384 docs.
 fn worker(c: &Ctx, a: usize, b: usize, cuts: &[usize]) -> Vec<WOut> {
-    let nt = c.tab.keys.len();
     let buf = c.buf;
-    let mut w = W { lc: hvec(nt + 1, [0, 0]), lastpm: vec![MISS; c.p_off.len() - 1], ..Default::default() };
+    let nt = c.nl;
+    let mut w = W { lc: hvec(nt, [0, 0]), lastpm: vec![MISS; c.p_off.len() - 1], ..Default::default() };
     let mut outs = Vec::new();
     let mut bounds: Vec<usize> = cuts.iter().copied().filter(|&x| x > a && x < b).collect();
     bounds.insert(0, a);
@@ -438,36 +470,37 @@ fn worker(c: &Ctx, a: usize, b: usize, cuts: &[usize]) -> Vec<WOut> {
         let mut doc = MISS;
         w.lc.fill([u16::MAX, 0]);
         w.base = parse_u32(&buf[a..a + buf[a..].iter().position(|&c| c == b'\t').unwrap()]);
-        w.ks.reserve(1 << 12);
-        scan(buf, a, b, |s, e, first| {
-            if first {
-                if doc != MISS {
-                    w.doc(c, doc);
+        let mut p = a;
+        while p < b {
+            let len = line_tokens(buf, p, &mut w.pos);
+            let np = w.pos.len() / 2;
+            if np > 0 {
+                let pos = &w.pos;
+                doc = parse_u32(&buf[p + pos[0] as usize..p + pos[1] as usize]);
+                w.ks.clear();
+                w.ks.reserve(np);
+                let ks = w.ks.as_mut_ptr();
+                for j in 1..np {
+                    let (s, e) = unsafe { (p + *pos.get_unchecked(2 * j) as usize, p + *pos.get_unchecked(2 * j + 1) as usize) };
+                    let len = e - s;
+                    let ent = if len <= 12 {
+                        let (k0, k1) = load12(buf, s, len);
+                        (k0, k1, h12(k0, k1))
+                    } else {
+                        (if len <= 32 { c.tab.get(&load_key(buf, s, len)) } else { MISS } as u64, u32::MAX, 0)
+                    };
+                    unsafe { ks.add(j - 1).write(ent) };
                 }
-                doc = parse_u32(&buf[s..e]);
-            } else {
-                let len = e - s;
-                let ent = if len <= 12 {
-                    let (k0, k1) = load12(buf, s, len);
-                    (k0, k1, h12(k0, k1))
-                } else {
-                    (if len <= 32 { c.tab.get(&load_key(buf, s, len)) } else { MISS } as u64, u32::MAX, 0)
-                };
-                if w.ks.len() == w.ks.capacity() {
-                    w.ks.reserve(w.ks.len());
-                }
-                unsafe { w.ks.as_mut_ptr().add(w.ks.len()).write(ent) };
-                unsafe { w.ks.set_len(w.ks.len() + 1) };
+                unsafe { w.ks.set_len(np - 1) };
+                w.doc(c, doc);
             }
-        });
-        if doc != MISS {
-            w.doc(c, doc);
+            p += len;
         }
         // local counting sort of the stream (small enough to stay in cache)
         let mut offs = Vec::with_capacity(nt + 1);
         offs.push(0);
         let mut acc = 0;
-        for e in &w.lc[..nt] {
+        for e in &w.lc {
             offs.push(acc); // offs[t + 1] is the write cursor of t, then its end
             acc += e[1] as u32;
         }
@@ -721,16 +754,13 @@ fn main() {
     let nth = std::env::var("NT").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
     let mut tab = Tab::new((qb.len() / 12).next_power_of_two().trailing_zeros().max(4));
     // In parallel: every query term as (B first BOOL term / A, O, N operator / P first phrase term / p, key, hash).
-    let toks: Vec<Vec<(u8, Key, u64)>> = std::thread::scope(|sc| {
+    let toks: Vec<Vec<(u64, u32, u8, u8)>> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nth)
             .map(|i| {
                 let (a, b) = (line_start(qb, qb.len() * i / nth), line_start(qb, qb.len() * (i + 1) / nth));
                 sc.spawn(move || {
-                    let mut v = Vec::with_capacity((b - a) / 6);
-                    let mut add = |op: u8, w: &[u8]| {
-                        let k = key_of(w);
-                        v.push((op, k, hk(&k)));
-                    };
+                    let mut v = Vec::with_capacity((b - a) / 5);
+                    let mut add = |op: u8, w: &[u8]| v.push((hk(&key_of(w)), (w.as_ptr() as usize - qb.as_ptr() as usize) as u32, w.len() as u8, op));
                     for line in qb[a..b].split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
                         if line.starts_with(b"BOOL ") {
                             let mut op = b'B';
@@ -762,11 +792,11 @@ fn main() {
         None => {}
     };
     for v in &toks {
-        for (j, &(op, ref k, h)) in v.iter().enumerate() {
+        for (j, &(h, o, l, op)) in v.iter().enumerate() {
             if let Some(x) = v.get(j + 16) {
-                tab.prefetch32((x.2 >> 32) as u32);
+                tab.prefetch32((x.0 >> 32) as u32);
             }
-            let t = tab.intern_h(k, h);
+            let t = tab.intern_h(&key_of(&qb[o as usize..o as usize + l as usize]), h);
             match op {
                 b'B' | b'P' => {
                     close(&mut qs, &ops, &mut p_off, &p_terms);
@@ -814,17 +844,38 @@ fn main() {
                     let a = line_start(buf, buf.len() * i / nth);
                     let b = line_start(buf, (a + (2 << 20) / nth).min(buf.len()));
                     let (mut df, mut last, mut docs) = (vec![0u32; nt], vec![MISS; nt], 0u32);
+                    // lookups go through an 8 deep ring so that the slots are prefetched
+                    let mut ring = [(0u64, 0u32, 0u32, 0u32); 8];
+                    let mut n = 0usize;
+                    let mut count = |t: u32, d: u32| {
+                        let t = t as usize;
+                        if t != MISS as usize && last[t] != d {
+                            last[t] = d;
+                            df[t] += 1;
+                        }
+                    };
                     scan(buf, a, b, |s, e, first| {
+                        let len = e - s;
                         if first {
                             docs += 1;
-                        } else if e - s <= 32 {
-                            let t = tab.get(&load_key(buf, s, e - s)) as usize;
-                            if t != MISS as usize && last[t] != docs {
-                                last[t] = docs;
-                                df[t] += 1;
+                        } else if len <= 12 {
+                            let (k0, k1) = load12(buf, s, len);
+                            let h = h12(k0, k1);
+                            tab.prefetch32(h);
+                            if n >= 8 {
+                                let (k0, k1, h, d) = ring[n & 7];
+                                count(tab.get12(k0, k1, h), d);
                             }
+                            ring[n & 7] = (k0, k1, h, docs);
+                            n += 1;
+                        } else if len <= 32 {
+                            count(tab.get(&load_key(buf, s, len)), docs);
                         }
                     });
+                    for j in n.saturating_sub(8)..n {
+                        let (k0, k1, h, d) = ring[j & 7];
+                        count(tab.get12(k0, k1, h), d);
+                    }
                     (df, docs)
                 })
             })
@@ -887,7 +938,8 @@ fn main() {
     }
     tab.set_flags(&flags);
     let mut bmv = hvec((nbm + 1) * w, 0u64);
-    let ctx = Ctx { dummy: nt as u32, buf, tab, bm: Ptr(bmv.as_mut_ptr()), w, kl_off, kl, p_off, p_terms };
+    let nbool = is_bool_term.iter().filter(|&&b| b).count();
+    let ctx = Ctx { dummy: nt as u32, lo: nbm, nl: nbool - nbm, buf, tab, bm: Ptr(bmv.as_mut_ptr()), w, kl_off, kl, p_off, p_terms };
 
     // ---- parallel index pass
     let id_at = |p: usize| if p >= buf.len() { u32::MAX } else { parse_u32(&buf[p..p + buf[p..].iter().position(|&c| c == b'\t').unwrap()]) };
@@ -900,13 +952,13 @@ fn main() {
         cuts.push(p);
     }
     cuts.push(buf.len());
-    // line starts of docs 32768, 65536, ... (binary search: ids ascend with the offset)
-    let pcuts: Vec<usize> = (1..(n_docs + 32767) >> 15)
+    // line starts of docs 16384, 32768, ... (binary search: ids ascend with the offset)
+    let pcuts: Vec<usize> = (1..(n_docs + 16383) >> 14)
         .map(|k| {
             let (mut lo, mut hi) = (0, buf.len());
             while lo < hi {
                 let mid = (lo + hi) / 2;
-                if id_at(line_start(buf, mid)) < (k << 15) as u32 { lo = mid + 1 } else { hi = mid }
+                if id_at(line_start(buf, mid)) < (k << 14) as u32 { lo = mid + 1 } else { hi = mid }
             }
             line_start(buf, lo)
         })
@@ -942,6 +994,7 @@ fn main() {
             let i = t * w;
             Set::R(&bmw[i..i + w])
         } else {
+            let t = t - nbm;
             let mut v = Vec::with_capacity(outs.iter().map(|o| (o.offs[t + 1] - o.offs[t]) as usize).sum());
             for o in &outs {
                 let r = o.offs[t] as usize..o.offs[t + 1] as usize;
