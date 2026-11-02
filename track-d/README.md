@@ -45,14 +45,14 @@ The run is one pipeline on a persistent pool of 12 parked threads. Phase times a
 - **ALT (landmarks):** not built. Estimated cost per landmark: a forward and a backward full Dijkstra (at ~150 ns per settled node, ~0.26 s each on one thread) plus 14 MB of distances. Even 6 landmarks run in parallel would cost more time than the 2,000 queries take now, and push memory past 150 MB.
 - **Radix heap:** tried twice, slower both times. The heaps are small, so the 4-ary heap stays in L1.
 - **Two queries interleaved per thread:** no gain, because the next settle's row and labels are already prefetched.
-- **PGO:** built with a profile trained only on generator seed 7 (`sample` ×3, `tiny` ×1, never the scored seed 1), then measured: about 8% slower in every Docker A/B (e.g. 269 vs 247 ms best on 8 P-core threads). Not used.
+- **PGO:** built with a profile trained only on generator seed 7 (`sample` ×3, `tiny` ×1, never the scored seed 1), then measured: about 8% slower in every Docker A/B (e.g. 269 vs 247 ms best on 8 P-core threads). A second try trained on a full-size seed-7 instance (×2) plus `sample` (×1) and timed on that same seed-7 instance was slower again (210/263 vs 198/256 ms on 8 P-core threads, 272/337 vs 219/300 ms on 12 threads, min/median). Not used.
 
 Smaller dead ends are listed in PERF.md.
 
 ## Limits
 
 - Ids are tagged as `thread << 26 | index`, so up to 64 threads and 2^26 nodes per thread.
-- Any u32 weights are supported; distances are exact up to u64. The common case uses u32 labels, with u64 and wide-key fallbacks.
+- Any u32 weights are supported; answers are exact over the spec's full range, up to (n - 1)(2^32 - 1). The common case uses u32 labels, with u64 and wide-key fallbacks.
 - Linux gets `mmap`, `mallopt` and `MADV_HUGEPAGE` through `extern "C"`. Other systems fall back to `std::fs::read` and the system allocator.
 - The pipeline's peak is the renumbering phase, where the first graph (27 MB), the node tags (7 MB) and the copied rows (24 MB) are alive together.
 - Local measurements did not always carry over to the board: steps 11–13 were 7% faster locally and flat on the board.

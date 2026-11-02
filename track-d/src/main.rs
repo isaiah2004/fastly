@@ -82,10 +82,6 @@ impl<T> P<T> {
 unsafe impl<T> Send for P<T> {}
 unsafe impl<T> Sync for P<T> {}
 
-fn atomics(v: &mut [u32]) -> &[AtomicU32] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const AtomicU32, v.len()) }
-}
-
 /// Address space for n Ts; pages are committed only where written. No huge pages,
 /// so a window's partly used tail costs at most one small page.
 fn reserve<T>(n: usize) -> *mut T {
@@ -367,9 +363,6 @@ impl Buckets {
         unsafe { *c.0.add(c.1) = B6(x as u32, (x >> 32) as u16) };
         c.1 += 1;
     }
-    fn len(&self, j: usize) -> usize {
-        self.full[j].len() * BLK + self.cur[j].1
-    }
     fn each(&self, j: usize, mut f: impl FnMut(u64)) {
         for (p, l) in self.full[j].iter().map(|&p| (p, BLK)).chain([self.cur[j]]) {
             for &x in unsafe { std::slice::from_raw_parts(p, l) } {
@@ -382,7 +375,6 @@ impl Buckets {
 /// Rows of one thread, in the new order, packed like `Cg` relative to the thread's
 /// own numbering; `ext` keys are a tag, or ESC | old id for a head that had no tag yet.
 struct Rows {
-    len: usize,
     deg: Vec<u8>,
     bigdeg: Vec<(u32, u32)>, // (node, degree) where deg says 255
     e: Vec<u32>,
@@ -397,7 +389,6 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32], win: (P<u32>, P<(u32, 
     const D1: usize = 16;
     const D2: usize = 8;
     let claim = |v: usize, x: usize| tag[v].load(Relaxed) == NONE && tag[v].compare_exchange(NONE, x as u32, Relaxed, Relaxed).is_ok();
-    let rg = |u: usize| g.row(u);
     // append the row (still hot in cache) of u, the thread's node number iu
     let copy = |r: &mut Rows, t: usize, iu: usize, u: u32, row: &[u32]| {
         if row.len() < 255 {
@@ -426,7 +417,7 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32], win: (P<u32>, P<(u32, 
         let mut done = 0;
         // e and ext live in this thread's windows of the shared forward arrays (never reallocated)
         let (e, ext) = unsafe { (Vec::from_raw_parts(win.0.at(t * win.2), 0, win.2), Vec::from_raw_parts(win.1.at(t * win.2), 0, win.2)) };
-        let mut r = Rows { len: 0, deg: Vec::with_capacity(n / nt * 5 / 4), bigdeg: Vec::new(), e, ext };
+        let mut r = Rows { deg: Vec::with_capacity(n / nt * 5 / 4), bigdeg: Vec::new(), e, ext };
         for s in (n * t / nt)..(n * (t + 1) / nt) {
             if !claim(s, t << 26 | done) {
                 continue;
@@ -440,13 +431,13 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32], win: (P<u32>, P<(u32, 
                     pf(unsafe { g.e.as_ptr().add(k) });
                 }
                 if let Some(&a) = list.get(q + D2) {
-                    for &x in &g.e[rg(a as usize)] {
+                    for &x in &g.e[g.row(a as usize)] {
                         let v = g.hd(x);
                         pf(&tag[v as usize]);
                         pf(&g.off[v as usize]);
                     }
                 }
-                let row = &g.e[rg(list[q] as usize)];
+                let row = &g.e[g.row(list[q] as usize)];
                 for &x in row {
                     let v = g.hd(x);
                     if claim(v as usize, t << 26 | (done + list.len())) {
@@ -458,12 +449,11 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32], win: (P<u32>, P<(u32, 
             }
             // the rows of the nodes left in the queue when the region filled up
             for i in q..list.len() {
-                copy(&mut r, t, done + i, list[i], &g.e[rg(list[i] as usize)]);
+                copy(&mut r, t, done + i, list[i], &g.e[g.row(list[i] as usize)]);
             }
             done += list.len();
             list.clear();
         }
-        r.len = done;
         r
     })
 }
@@ -483,13 +473,11 @@ struct St<L> {
 
 /// Label storage type: u32 (compact, tried first) or u64.
 trait Lab: Copy + PartialEq {
-    const MAX: Self;
     const LIM: u64; // stored distances must be below this
     fn w(d: u64) -> Self;
     fn r(self) -> u64;
 }
 impl Lab for u32 {
-    const MAX: u32 = u32::MAX;
     const LIM: u64 = u32::MAX as u64;
     fn w(d: u64) -> u32 {
         d as u32
@@ -499,7 +487,6 @@ impl Lab for u32 {
     }
 }
 impl Lab for u64 {
-    const MAX: u64 = INF;
     const LIM: u64 = INF;
     fn w(d: u64) -> u64 {
         d
@@ -534,9 +521,9 @@ impl<L: Lab> St<L> {
         let lo = (p as usize) << PB;
         let pool = &mut self.pool[s];
         if pool.len() < lo + (1 << PB) {
-            pool.resize(lo + (1 << PB), L::MAX);
+            pool.resize(lo + (1 << PB), L::w(INF));
         } else {
-            pool[lo..lo + (1 << PB)].fill(L::MAX);
+            pool[lo..lo + (1 << PB)].fill(L::w(INF));
         }
         self.dir[s][(v >> PB) as usize] = p;
         p
@@ -770,7 +757,7 @@ fn main() {
     let gm = (1u32 << gw) - 1;
     let mut sb = vec![0u32];
     for j in 0..ns {
-        let c = parts.iter().map(|p| p.len(j)).sum::<usize>() + huge.iter().filter(|e| sown(e[0]) == j).count();
+        let c = parts.iter().map(|p| p.full[j].len() * BLK + p.cur[j].1).sum::<usize>() + huge.iter().filter(|e| sown(e[0]) == j).count();
         sb.push(sb[j] + c as u32);
     }
     let m = sb[ns] as usize;
@@ -819,21 +806,21 @@ fn main() {
     big.sort_unstable();
     drop(parts);
     let g0 = Csr { off: off0, e: e0, big, gw, gm };
-    let mut tag = vec![NONE; n];
+    let tag: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(NONE)).collect();
     // thread t's rows go to window [t * m, t * m + its edges) of the forward arrays,
     // written in place by the BFS: no concatenation copy
     let win = (P(reserve::<u32>(nt * m)), P(reserve::<(u32, u32)>(nt * m)), m);
-    let parts = order(&g0, n, nt, atomics(&mut tag), win);
+    let parts = order(&g0, n, nt, &tag, win);
     drop(g0);
     // node ids: thread t's i-th node is nb0[t] + i; a dummy node closes each thread's
     // segment (its row is the unused rest of the window, it is never reached)
     let mut nb0 = vec![0usize];
     for p in &parts {
-        nb0.push(nb0.last().unwrap() + p.len + 1);
+        nb0.push(nb0.last().unwrap() + p.deg.len() + 1);
     }
     let n2 = nb0[nt];
     let id = |x: u32| (nb0[x as usize >> 26] + (x as usize & ((1 << 26) - 1))) as u32;
-    let nid = |old: u32| id(tag[old as usize]);
+    let nid = |old: u32| id(tag[old as usize].load(Relaxed));
     let mut off: Vec<u32> = uninit(n2 + 1);
     let op = P(off.as_mut_ptr());
     par(nt, |t| {
