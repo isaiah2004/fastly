@@ -20,7 +20,6 @@ fn s<T>(v: T) -> S<T> { S(UnsafeCell::new(v)) }
 #[repr(align(128))] // no false sharing between threads
 struct Loc {
 	cnt: Vec<u64>, // [hour*NE + id]: count | errors<<32, later the scatter cursor
-	ids: Vec<u16>, // per line: endpoint id | latency digits<<11
 	hm: u128,      // hours seen
 }
 
@@ -32,6 +31,39 @@ struct Tab {
 	ent: *mut Ent,
 	nid: AU,
 	gs: Vec<AtomicU32>, // id -> slot
+	hs: Vec<AtomicU64>, // slot -> full hash
+	dup: AtomicBool,    // two different endpoints share a full hash and length
+}
+
+// endpoint id: probe from the hash; byte-compare when verifying (pass 1) or if hashes are not unique
+#[inline(always)]
+unsafe fn find(tb: &Tab, e: *const u8, n: usize, hv: u64, verify: bool) -> usize {
+	let tag = hv >> 32 << 32 | (n as u64) << 16;
+	let mut s = hv as usize & (TS - 1);
+	loop {
+		let sl = tb.slot.get_unchecked(s);
+		let t = sl.load(Acquire);
+		if t >> 16 == tag >> 16 && tb.hs.get_unchecked(s).load(Relaxed) == hv {
+			if !verify || v::eq(e, n, (*tb.ent.add(s)).0.as_ptr()) {
+				return (t & 0xffff) as usize - 1;
+			}
+			tb.dup.store(true, Relaxed);
+		} else if t == 0 {
+			if sl.compare_exchange(0, 1, Acquire, Relaxed).is_ok() {
+				std::ptr::copy_nonoverlapping(e, (*tb.ent.add(s)).0.as_mut_ptr(), n);
+				let id = tb.nid.fetch_add(1, Relaxed);
+				assert!(id < NE);
+				tb.gs[id].store(s as u32, Relaxed);
+				tb.hs[s].store(hv, Relaxed);
+				sl.store(tag | (id as u64 + 1), Release);
+				return id;
+			}
+			continue;
+		} else if t == 1 {
+			continue; // another thread is inserting here
+		}
+		s = (s + 1) & (TS - 1);
+	}
 }
 
 #[cfg(target_feature = "avx2")]
@@ -127,52 +159,29 @@ unsafe fn lines(d: *const u8, mut s: usize, end: usize, mut f: impl FnMut(usize,
 	s
 }
 
-// pass 1: intern endpoints, count per (hour, endpoint), keep endpoint id and latency width per line
+// pass 1: intern endpoints, count lines and errors per (hour, endpoint)
 unsafe fn pass1(d: *const u8, p: usize, end: usize, l: &mut Loc, tb: &Tab) -> usize {
 	lines(d, p, end, |p, nl| {
 		let h = hour(d.add(p));
 		let es = ep_start(d, p);
-		let e = d.add(es);
 		let sp = nl - 16 + v::lastsp(d.add(nl - 16)); // the space before the latency
 		let n = sp - 4 - es;
-		let hv = v::hash(e, n);
-		let tag = hv >> 32 << 32 | (n as u64) << 16;
-		let mut s = hv as usize & (TS - 1);
-		let id = loop {
-			let sl = tb.slot.get_unchecked(s);
-			let t = sl.load(Acquire);
-			if t >> 16 == tag >> 16 {
-				if v::eq(e, n, (*tb.ent.add(s)).0.as_ptr()) {
-					break (t & 0xffff) as usize - 1;
-				}
-			} else if t == 0 {
-				if sl.compare_exchange(0, 1, Acquire, Relaxed).is_ok() {
-					std::ptr::copy_nonoverlapping(e, (*tb.ent.add(s)).0.as_mut_ptr(), n);
-					let id = tb.nid.fetch_add(1, Relaxed);
-					assert!(id < NE);
-					tb.gs[id].store(s as u32, Relaxed);
-					sl.store(tag | (id as u64 + 1), Release);
-					break id;
-				}
-				continue;
-			} else if t == 1 {
-				continue; // another thread is inserting here
-			}
-			s = (s + 1) & (TS - 1);
-		};
+		let id = find(tb, d.add(es), n, v::hash(d.add(es), n), true);
 		*l.cnt.get_unchecked_mut(h * NE + id) += 1 | ((*d.add(sp - 3) == b'5') as u64) << 32;
-		l.ids.push((id | (nl - sp - 1) << 11) as u16);
 		l.hm |= 1 << h;
 	})
 }
 
-// pass 2: scatter each latency into its group's slot
-unsafe fn pass2(d: *const u8, p: usize, end: usize, k: &mut usize, l: &mut Loc, lat: *mut u32) -> usize {
+// pass 2: find the endpoint again (read-only table) and scatter the latency into its group's slot
+unsafe fn pass2(d: *const u8, p: usize, end: usize, l: &mut Loc, tb: &Tab, lat: *mut u32) -> usize {
+	let dup = tb.dup.load(Relaxed);
 	lines(d, p, end, |p, nl| {
-		let id = *l.ids.get_unchecked(*k) as usize;
-		*k += 1;
-		let c = l.cnt.get_unchecked_mut(hour(d.add(p)) * NE + (id & 2047));
-		*lat.add(*c as usize) = v::lat(d.add(nl - 16), id >> 11);
+		let es = ep_start(d, p);
+		let ls = v::lastsp(d.add(nl - 16));
+		let n = nl - 20 + ls - es;
+		let id = find(tb, d.add(es), n, v::hash(d.add(es), n), dup);
+		let c = l.cnt.get_unchecked_mut(hour(d.add(p)) * NE + id);
+		*lat.add(*c as usize) = v::lat(d.add(nl - 16), 15 - ls);
 		*c += 1;
 	})
 }
@@ -283,7 +292,6 @@ unsafe fn work(t: usize, c: &Cx) {
 	let (x, y) = (c.b[t], c.b[t + 1]);
 	let l = c.locs[t].g();
 	l.cnt = vec![0; NE * H];
-	l.ids = Vec::with_capacity((y - x) / 40 + 8);
 	#[cfg(target_os = "linux")]
 	madvise(buf.as_ptr().add(x & !4095), y - (x & !4095), 22); // MADV_POPULATE_READ, page tables in parallel
 	chunk(buf, x, y, |d, p, e| pass1(d, p, e, l, tb));
@@ -335,9 +343,7 @@ unsafe fn work(t: usize, c: &Cx) {
 	c.bar.wait();
 	let lp = c.lat.g().as_mut_ptr();
 	let l = c.locs[t].g();
-	let mut k = 0;
-	chunk(buf, x, y, |d, p, e| pass2(d, p, e, &mut k, l, lp));
-	l.ids = Vec::new();
+	chunk(buf, x, y, |d, p, e| pass2(d, p, e, l, tb, lp));
 	c.bar.wait();
 	// exact nearest-rank percentiles per group, and output bytes per hour
 	let (go, ge, nm, st) = (&c.goff.g()[..], &c.gerr.g()[..], &c.names.g()[..], c.st.g());
@@ -447,6 +453,8 @@ fn main() {
 			ent: unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(TS * 128, 64).unwrap()) as *mut Ent },
 			nid: AU::new(0),
 			gs: (0..NE).map(|_| AtomicU32::new(0)).collect(),
+			hs: (0..TS).map(|_| AtomicU64::new(0)).collect(),
+			dup: AtomicBool::new(false),
 		},
 		ord: s(vec![]),
 		names: s(vec![]),

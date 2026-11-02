@@ -13,3 +13,4 @@ Local numbers come from a laptop: i5-12450H, Docker Desktop on WSL2, a host shar
 | 4 | Output via ftruncate+mmap, threads format straight into the page cache; LUT itoa | | 0.066 (local) | ~23 (local) | |
 | 5 | One lock-free intern table shared by all threads (no merge); p50, then p95, then p99 selected on shrinking upper parts; per-thread state aligned to 128 B (removes false sharing); parallel MADV_POPULATE_READ | | 0.053 (local) | ~19 (local) | |
 | 6 | Source compacted (thread body in one function, shared context struct), same algorithm; src 21.7 KB to 16.6 KB | | ~0.055 (local, host loaded) | ~20 (local) | |
+| 7 | Drop the 6.2 MB per-line id array: pass 2 finds the endpoint again with a read-only, verification-free probe (full 64-bit hash plus length; it falls back to a byte compare if pass 1 ever saw two endpoints share both). Interleaved A/B over 20 runs showed no time change (min 54.0 vs 53.0 ms), and memory dropped | | ~0.054 (local) | ~12 (local) | |
