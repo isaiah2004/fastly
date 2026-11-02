@@ -168,27 +168,59 @@ fn chunks(b: &[u8], start: usize, k: usize) -> Vec<(usize, usize)> {
     cuts.windows(2).map(|w| (w[0], w[1])).collect()
 }
 
-/// Compressed sparse rows: heads `v`, weights `w` as u16 where 0xFFFF means
-/// "look the weight up in `big`" (sorted by edge index; only huge weights).
+/// The first graph (old ids), 4 bytes per edge: head << gw | weight, where the
+/// weight field gm (all ones) means "look the weight up in `big`" (sorted by edge index).
 struct Csr {
     off: Vec<u32>,
-    e: Vec<E>,
+    e: Vec<u32>,
     big: Vec<(u32, u32)>,
-}
-
-/// One edge in a row: head and (escaped) weight, 6 bytes, so a row is one stream.
-#[derive(Clone, Copy)]
-#[repr(C, packed)]
-struct E {
-    v: u32,
-    w: u16,
+    gw: u32,
+    gm: u32,
 }
 
 impl Csr {
     #[inline(always)]
+    fn hd(&self, x: u32) -> u32 {
+        x >> self.gw
+    }
+    #[inline(always)]
     fn wt(&self, k: usize) -> u64 {
-        let w = unsafe { self.e.get_unchecked(k).w };
-        if w != 0xFFFF { w as u64 } else { self.big[self.big.binary_search_by_key(&(k as u32), |x| x.0).unwrap()].1 as u64 }
+        let w = unsafe { *self.e.get_unchecked(k) } & self.gm;
+        if w != self.gm { w as u64 } else { self.big[self.big.binary_search_by_key(&(k as u32), |x| x.0).unwrap()].1 as u64 }
+    }
+    fn row(&self, u: usize) -> std::ops::Range<usize> {
+        self.off[u] as usize..self.off[u + 1] as usize
+    }
+}
+
+/// Final graph rows, 4 bytes per edge: (head - tail + 2^15) << 15 | weight when both
+/// fit (bit 31 clear), else 2^31 | index into `ext` = (head, weight). After the
+/// locality renumbering nearly every edge fits.
+struct Cg {
+    off: Vec<u32>,
+    e: Vec<u32>,
+    ext: Vec<(u32, u32)>,
+}
+
+const ESC: u32 = 1 << 31;
+
+/// The packed form of an edge u -> v of weight w, if it fits.
+#[inline(always)]
+fn enc(u: u32, v: u32, w: u32) -> Option<u32> {
+    let d = (v as i64 - u as i64 + 32768) as u64;
+    (d < 65536 && w < 32768).then(|| (d as u32) << 15 | w)
+}
+
+impl Cg {
+    #[inline(always)]
+    fn edge(&self, u: u32, k: usize) -> (u32, u64) {
+        let x = unsafe { *self.e.get_unchecked(k) };
+        if x & ESC == 0 {
+            ((u + (x >> 15)).wrapping_sub(32768), (x & 0x7FFF) as u64)
+        } else {
+            let (v, w) = unsafe { *self.ext.get_unchecked((x & !ESC) as usize) };
+            (v, w as u64)
+        }
     }
     fn row(&self, u: usize) -> std::ops::Range<usize> {
         self.off[u] as usize..self.off[u + 1] as usize
@@ -284,11 +316,18 @@ fn prefix(c: &mut [u32], nt: usize) {
 /// Per-thread edge buckets: each bucket is a chain of BLK-entry blocks cut from a
 /// few big slabs, so thousands of buckets cost a handful of allocations.
 const BLK: usize = 512;
+/// A 48-bit bucket entry.
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct B6 {
+    lo: u32,
+    hi: u16,
+}
 struct Buckets {
-    slabs: Vec<Vec<u64>>,
+    slabs: Vec<Vec<B6>>,
     used: usize,
-    full: Vec<Vec<*const u64>>,
-    cur: Vec<(*mut u64, usize)>,
+    full: Vec<Vec<*const B6>>,
+    cur: Vec<(*mut B6, usize)>,
 }
 unsafe impl Send for Buckets {}
 unsafe impl Sync for Buckets {}
@@ -301,7 +340,7 @@ impl Buckets {
         }
         b
     }
-    fn block(&mut self) -> *mut u64 {
+    fn block(&mut self) -> *mut B6 {
         if self.used + BLK > self.slabs.last().unwrap().capacity() {
             self.slabs.push(Vec::with_capacity(64 * BLK));
             self.used = 0;
@@ -319,28 +358,29 @@ impl Buckets {
             self.cur[j] = (q, 0);
         }
         let c = unsafe { self.cur.get_unchecked_mut(j) };
-        unsafe { *c.0.add(c.1) = x };
+        unsafe { *c.0.add(c.1) = B6 { lo: x as u32, hi: (x >> 32) as u16 } };
         c.1 += 1;
     }
     fn each(&self, j: usize, mut f: impl FnMut(u64)) {
         for &p in &self.full[j] {
             for &x in unsafe { std::slice::from_raw_parts(p, BLK) } {
-                f(x);
+                f(x.lo as u64 | (x.hi as u64) << 32);
             }
         }
         let (p, l) = self.cur[j];
         for &x in unsafe { std::slice::from_raw_parts(p, l) } {
-            f(x);
+            f(x.lo as u64 | (x.hi as u64) << 32);
         }
     }
 }
 
-/// Rows of one thread, in the new order (heads still old ids).
+/// Rows of one thread, in the new order, packed like `Cg` relative to the thread's
+/// own numbering; `ext` keys are a tag, or ESC | old id for a head that had no tag yet.
 struct Rows {
     len: usize,
     off: Vec<u32>,
-    e: Vec<E>,
-    big: Vec<(u32, u32)>,
+    e: Vec<u32>,
+    ext: Vec<(u32, u32)>,
 }
 
 /// Locality order: parallel region growing (BFS from seeds, regions capped).
@@ -352,15 +392,34 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32]) -> Vec<Rows> {
     const D2: usize = 8;
     let claim = |v: usize, x: usize| tag[v].load(Relaxed) == NONE && tag[v].compare_exchange(NONE, x as u32, Relaxed, Relaxed).is_ok();
     let rg = |u: usize| g.row(u);
+    // append the row (still hot in cache) of u, the thread's node number iu
+    let copy = |r: &mut Rows, t: usize, iu: usize, u: u32, row: &[u32]| {
+        r.off.push(r.e.len() as u32);
+        for (j, &x) in row.iter().enumerate() {
+            let w = if x & g.gm == g.gm { g.wt(g.off[u as usize] as usize + j) as u32 } else { x & g.gm };
+            let hv = g.hd(x);
+            let tv = tag[hv as usize].load(Relaxed);
+            if tv >> 26 == t as u32 {
+                if let Some(c) = enc(iu as u32, tv & ((1 << 26) - 1), w) {
+                    r.e.push(c);
+                    continue;
+                }
+            }
+            r.e.push(ESC | r.ext.len() as u32);
+            r.ext.push((if tv == NONE { ESC | hv } else { tv }, w));
+        }
+    };
     par(nt, |t| {
-        let mut list: Vec<u32> = Vec::with_capacity(n / nt * 5 / 4);
+        // the BFS queue of the current region; earlier regions' nodes number 0..done
+        let mut list: Vec<u32> = Vec::with_capacity(2 * CAP);
+        let mut done = 0;
         let c = g.e.len() / nt * 5 / 4;
-        let mut r = Rows { len: 0, off: Vec::with_capacity(n / nt * 5 / 4), e: Vec::with_capacity(c), big: Vec::new() };
+        let mut r = Rows { len: 0, off: Vec::with_capacity(n / nt * 5 / 4), e: Vec::with_capacity(c), ext: Vec::new() };
         for s in (n * t / nt)..(n * (t + 1) / nt) {
-            if !claim(s, t << 26 | list.len()) {
+            if !claim(s, t << 26 | done) {
                 continue;
             }
-            let start = list.len();
+            let start = 0;
             list.push(s as u32);
             let mut q = start;
             while q < list.len() && list.len() - start < CAP {
@@ -370,36 +429,35 @@ fn order(g: &Csr, n: usize, nt: usize, tag: &[AtomicU32]) -> Vec<Rows> {
                     pf(unsafe { g.e.as_ptr().add(k) });
                 }
                 if let Some(&a) = list.get(q + D2) {
-                    for x in &g.e[rg(a as usize)] {
-                        let v = x.v;
+                    for &x in &g.e[rg(a as usize)] {
+                        let v = g.hd(x);
                         pf(&tag[v as usize]);
                         pf(&g.off[v as usize]);
                     }
                 }
-                for x in &g.e[rg(list[q] as usize)] {
-                    let v = x.v;
-                    if claim(v as usize, t << 26 | list.len()) {
+                let row = &g.e[rg(list[q] as usize)];
+                for &x in row {
+                    let v = g.hd(x);
+                    if claim(v as usize, t << 26 | (done + list.len())) {
                         list.push(v);
                     }
                 }
+                copy(&mut r, t, done + q, list[q], row);
                 q += 1;
             }
-            for &u in &list[start..] {
-                r.off.push(r.e.len() as u32);
-                for k in rg(u as usize) {
-                    if g.e[k].w == 0xFFFF {
-                        r.big.push((r.e.len() as u32 + (k - g.off[u as usize] as usize) as u32, g.wt(k) as u32));
-                    }
-                }
-                r.e.extend_from_slice(&g.e[rg(u as usize)]);
+            // the rows of the nodes left in the queue when the region filled up
+            for i in q..list.len() {
+                copy(&mut r, t, done + i, list[i], &g.e[rg(list[i] as usize)]);
             }
+            done += list.len();
+            list.clear();
         }
-        r.len = list.len();
+        r.len = done;
         r
     })
 }
 
-const PB: u32 = 8;
+const PB: u32 = 6;
 const PM: u32 = (1 << PB) - 1;
 
 /// Per-thread search state. Distance labels of both directions sit side by side
@@ -452,6 +510,13 @@ impl<L: Lab> St<L> {
             INF
         } else {
             unsafe { self.pool.get_unchecked(((p << PB) | (v & PM)) as usize)[s].r() }
+        }
+    }
+    #[inline(always)]
+    fn pf(&self, v: u32) {
+        let p = unsafe { *self.dir.get_unchecked((v >> PB) as usize) };
+        if p != NONE {
+            pf(unsafe { self.pool.as_ptr().add(((p << PB) | (v & PM)) as usize) });
         }
     }
     #[cold]
@@ -560,7 +625,7 @@ fn pf<T>(p: *const T) {
 
 /// Bidirectional Dijkstra; always expands the side with the smaller heap.
 /// None if a distance does not fit the packed heap key.
-fn query<L: Lab>(g: [&Csr; 2], st: &mut St<L>, s: u32, t: u32, nb: u32) -> Option<u64> {
+fn query<L: Lab>(g: [&Cg; 2], st: &mut St<L>, s: u32, t: u32, nb: u32) -> Option<u64> {
     if s == t {
         return Some(0);
     }
@@ -586,13 +651,15 @@ fn query<L: Lab>(g: [&Csr; 2], st: &mut St<L>, s: u32, t: u32, nb: u32) -> Optio
         }
         let gr = g[sd];
         if let Some(&y) = st.heap[sd].first() {
-            let k = unsafe { *gr.off.get_unchecked((y & mask) as usize) as usize };
+            let y = (y & mask) as u32;
+            let k = unsafe { *gr.off.get_unchecked(y as usize) as usize };
             pf(unsafe { gr.e.as_ptr().add(k) });
+            st.pf(y);
         }
         let (lo, hi) = unsafe { (*gr.off.get_unchecked(u as usize) as usize, *gr.off.get_unchecked(u as usize + 1) as usize) };
         for k in lo..hi {
-            let v = unsafe { gr.e.get_unchecked(k).v };
-            let nd = d + gr.wt(k);
+            let (v, w) = gr.edge(u, k);
+            let nd = d + w;
             if nd < mu {
                 if nd >= lim {
                     ok = false;
@@ -618,7 +685,7 @@ fn query<L: Lab>(g: [&Csr; 2], st: &mut St<L>, s: u32, t: u32, nb: u32) -> Optio
 
 /// Plain Dijkstra with wide keys, for the (never seen) case of huge distances.
 #[cold]
-fn slow(g: &Csr, s: u32, t: u32) -> u64 {
+fn slow(g: &Cg, s: u32, t: u32) -> u64 {
     use std::{cmp::Reverse, collections::*};
     let mut dist: HashMap<u32, u64> = HashMap::new();
     let mut h = BinaryHeap::new();
@@ -632,7 +699,8 @@ fn slow(g: &Csr, s: u32, t: u32) -> u64 {
             return d;
         }
         for k in g.row(u as usize) {
-            let (v, nd) = (g.e[k].v, d + g.wt(k));
+            let (v, w) = g.edge(u, k);
+            let nd = d + w;
             if dist.get(&v).map_or(true, |&o| nd < o) {
                 dist.insert(v, nd);
                 h.push(Reverse((nd, v)));
@@ -686,7 +754,7 @@ fn main() {
     // g0 is built from buckets of ns = nt * SUB row slots (thread t handles slots
     // t * SUB .. (t + 1) * SUB one at a time, so its scattered writes stay in cache).
     // parts[p], bucket j: edges parsed by thread p whose tail is in slot j, packed as
-    // (tail - slo(j)) << (16 + nb) | head << 16 | weight; weights >= 0xFFFF go to `huge`
+    // 48 bits: (tail - slo(j)) << (wb + nb) | head << wb | weight; heavier edges go to `huge`
     const SUB: usize = 8;
     let ns = nt * SUB;
     let smul = ((ns as u64) << 32) / n as u64;
@@ -694,7 +762,9 @@ fn main() {
     let slos: Vec<usize> = (0..=ns).map(|j| (((j as u64) << 32).div_ceil(smul) as usize).min(n)).collect();
     let slo = |j: usize| slos[j];
     let nb = (usize::BITS - n.leading_zeros()).max(1);
-    let (vs, vm) = (16 + nb, (1u64 << nb) - 1);
+    let ub = (0..ns).map(|j| usize::BITS - (slo(j + 1) - slo(j)).leading_zeros()).max().unwrap();
+    let wb = 48u32.saturating_sub(nb + ub).min(16);
+    let (vs, vm, wm) = (wb + nb, (1u64 << nb) - 1, (1u32 << wb) - 1);
     let res = par(nt, |t| {
         let (a, b) = ch[t];
         let mut bk = Buckets::new(ns, (b - a) / 18 * 21 / 20);
@@ -704,9 +774,9 @@ fn main() {
             let (u, v, w, j) = edge(gb, i);
             i = j;
             if u == v {
-            } else if w < 0xFFFF {
+            } else if w < wm {
                 let o = sown(u);
-                bk.push(o, ((u as usize - slo(o)) as u64) << vs | (v as u64) << 16 | w as u64);
+                bk.push(o, ((u as usize - slo(o)) as u64) << vs | (v as u64) << wb | w as u64);
             } else {
                 huge.push([u, v, w]);
             }
@@ -733,7 +803,10 @@ fn main() {
     let mut off0 = deg;
     prefix(&mut off0, nt);
     let m = off0[n] as usize;
-    let mut e0: Vec<E> = uninit(m);
+    let mut e0: Vec<u32> = uninit(m);
+    // first graph: head << gw | weight, weights >= gm escaped to `big`
+    let gw = 32 - nb;
+    let gm = (1u32 << gw) - 1;
     let ep = P(e0.as_mut_ptr());
     let mut big: Vec<(u32, u32)> = par(nt, |t| {
         let ep = ep;
@@ -745,13 +818,17 @@ fn main() {
             for p in &parts {
                 p.each(j, |x| {
                     let k = unsafe { cur.get_unchecked_mut((x >> vs) as usize) };
-                    unsafe { *ep.0.add(*k as usize) = E { v: (x >> 16 & vm) as u32, w: x as u16 } };
+                    let (v, w) = ((x >> wb & vm) as u32, (x & wm as u64) as u32);
+                    unsafe { *ep.0.add(*k as usize) = v << gw | w.min(gm) };
+                    if w >= gm {
+                        big.push((*k, w));
+                    }
                     *k += 1;
                 });
             }
             for e in huge.iter().filter(|e| sown(e[0]) == j) {
                 let k = &mut cur[e[0] as usize - slo(j)];
-                unsafe { *ep.0.add(*k as usize) = E { v: e[1], w: 0xFFFF } };
+                unsafe { *ep.0.add(*k as usize) = e[1] << gw | gm };
                 big.push((*k, e[2]));
                 *k += 1;
             }
@@ -761,58 +838,57 @@ fn main() {
     .concat();
     big.sort_unstable();
     drop(parts);
-    let g0 = Csr { off: off0, e: e0, big };
+    let g0 = Csr { off: off0, e: e0, big, gw, gm };
     lap("csr0");
-    let mut perm = vec![NONE; n];
-    let parts = order(&g0, n, nt, atomics(&mut perm));
+    let mut tag = vec![NONE; n];
+    let parts = order(&g0, n, nt, atomics(&mut tag));
     drop(g0);
-    let (mut nb0, mut eb0) = (vec![0usize], vec![0usize]);
+    let (mut nb0, mut eb0, mut xb0) = (vec![0usize], vec![0usize], vec![0usize]);
     for p in &parts {
         nb0.push(nb0.last().unwrap() + p.len);
         eb0.push(eb0.last().unwrap() + p.e.len());
+        xb0.push(xb0.last().unwrap() + p.ext.len());
     }
-    let pp = P(perm.as_mut_ptr());
-    par(nt, |t| {
-        let pp = pp;
-        for i in lo(t)..lo(t + 1) {
-            let x = unsafe { &mut *pp.0.add(i) };
-            *x = (nb0[*x as usize >> 26] + (*x as usize & ((1 << 26) - 1))) as u32;
-        }
-    });
+    // new id from a tag: thread t's i-th node is nb0[t] + i
+    let newid = |x: u32| (nb0[x as usize >> 26] + (x as usize & ((1 << 26) - 1))) as u32;
+    let nid = |old: u32| newid(tag[old as usize]);
     lap("order");
-    // forward CSR in the new numbering: the copied rows, heads renamed
+    // forward graph: the threads' rows side by side, escapes resolved
     let mut off: Vec<u32> = uninit(n + 1);
-    let mut fe: Vec<E> = uninit(m);
-    let (op, ep) = (P(off.as_mut_ptr()), P(fe.as_mut_ptr()));
-    let big = par(nt, |t| {
-        let (op, ep) = (op, ep);
+    let mut fe: Vec<u32> = uninit(m);
+    let mut fx: Vec<(u32, u32)> = uninit(*xb0.last().unwrap());
+    let (op, ep, xp) = (P(off.as_mut_ptr()), P(fe.as_mut_ptr()), P(fx.as_mut_ptr()));
+    par(nt, |t| {
+        let (op, ep, xp) = (op, ep, xp);
         let r = &parts[t];
         for (i, &o) in r.off.iter().enumerate() {
             unsafe { *op.0.add(nb0[t] + i) = (eb0[t] + o as usize) as u32 };
         }
-        for (j, x) in r.e.iter().enumerate() {
-            unsafe { *ep.0.add(eb0[t] + j) = E { v: perm[x.v as usize], w: x.w } };
+        for (j, &x) in r.e.iter().enumerate() {
+            unsafe { *ep.0.add(eb0[t] + j) = if x & ESC != 0 { x + xb0[t] as u32 } else { x } };
         }
-        r.big.iter().map(|&(j, w)| (eb0[t] as u32 + j, w)).collect::<Vec<_>>()
-    })
-    .concat();
+        for (j, &(key, w)) in r.ext.iter().enumerate() {
+            let v = if key & ESC != 0 { nid(key & !ESC) } else { newid(key) };
+            unsafe { *xp.0.add(xb0[t] + j) = (v, w) };
+        }
+    });
     off[n] = m as u32;
     drop(parts);
-    let fwd = Csr { off, e: fe, big };
+    let fwd = Cg { off, e: fe, ext: fx };
     // distinct queries (duplicate lines are answered once)
     let (mut qs, mut qi, mut seen) = (Vec::new(), Vec::new(), std::collections::HashMap::new());
     let mut i = 0;
     while i < qb.len() {
-        let s = perm[num(qb, &mut i) as usize];
-        let t = perm[num(qb, &mut i) as usize];
+        let s = nid(num(qb, &mut i) as u32);
+        let t = nid(num(qb, &mut i) as u32);
         qi.push(*seen.entry((s, t)).or_insert_with(|| {
             qs.push((s, t));
             qs.len() - 1
         }));
     }
-    drop(perm);
+    drop(tag);
     lap("fwd");
-    // reverse CSR: edges whose head another thread owns are handed over in lists
+    // reverse graph: edges whose head another thread owns are handed over in lists
     let mut roff = vec![0u32; n + 1];
     let rp = P(roff.as_mut_ptr());
     // cross[t][o]: (head, tail, fwd edge index) for edges whose head thread o owns
@@ -821,7 +897,7 @@ fn main() {
         let mut cr = vec![Vec::new(); nt];
         for u in lo(t)..lo(t + 1) {
             for k in fwd.row(u) {
-                let v = fwd.e[k].v;
+                let v = fwd.edge(u as u32, k).0;
                 if own(v) == t {
                     unsafe { *rp.0.add(v as usize) += 1 };
                 } else {
@@ -838,38 +914,55 @@ fn main() {
         }
     });
     prefix(&mut roff, nt);
-    let mut re: Vec<E> = uninit(m);
+    let mut re: Vec<u32> = uninit(m);
     let ep = P(re.as_mut_ptr());
-    let mut big = par(nt, |t| {
+    let rx = par(nt, |t| {
         let ep = ep;
         let base = lo(t);
         let mut cur = roff[base..lo(t + 1)].to_vec();
-        let mut big = Vec::new();
+        let mut ext = Vec::new();
         let mut put = |v: u32, u: u32, k: usize| {
             let c = &mut cur[v as usize - base];
-            let w = fwd.e[k].w;
-            unsafe { *ep.0.add(*c as usize) = E { v: u, w } };
-            if w == 0xFFFF {
-                big.push((*c, fwd.wt(k) as u32));
-            }
+            let w = fwd.edge(u, k).1 as u32;
+            let x = enc(v, u, w).unwrap_or_else(|| {
+                ext.push((u, w));
+                ESC | (ext.len() - 1) as u32
+            });
+            unsafe { *ep.0.add(*c as usize) = x };
             *c += 1;
         };
         for u in base..lo(t + 1) {
             for k in fwd.row(u) {
-                if own(fwd.e[k].v) == t {
-                    put(fwd.e[k].v, u as u32, k);
+                let v = fwd.edge(u as u32, k).0;
+                if own(v) == t {
+                    put(v, u as u32, k);
                 }
             }
         }
         for x in cross.iter().flat_map(|c| &c[t]) {
             put(x[0], x[1], x[2] as usize);
         }
-        big
-    })
-    .concat();
-    big.sort_unstable();
+        ext
+    });
     drop(cross);
-    let bwd = Csr { off: roff, e: re, big };
+    // thread-local escape indices -> global
+    let mut xb = vec![0u32];
+    for x in &rx {
+        xb.push(xb.last().unwrap() + x.len() as u32);
+    }
+    par(nt, |t| {
+        let ep = ep;
+        for k in roff[lo(t)] as usize..roff[lo(t + 1)] as usize {
+            let x = unsafe { &mut *ep.0.add(k) };
+            if *x & ESC != 0 {
+                *x += xb[t];
+            }
+        }
+    });
+    if tm {
+        eprintln!("escapes fwd {} bwd {} of {m}", fwd.ext.len(), xb[nt]);
+    }
+    let bwd = Cg { off: roff, e: re, ext: rx.concat() };
     lap("csr");
 
     let ans: Vec<AtomicU64> = (0..qs.len()).map(|_| AtomicU64::new(0)).collect();
